@@ -1,0 +1,8 @@
+node_modules
+.next
+out
+examples
+.git
+.claude
+public/_test
+*.log
