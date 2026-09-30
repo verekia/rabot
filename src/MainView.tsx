@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { DEFAULT_GLOBAL } from './audio/plan'
+import { DEFAULT_GLOBAL, TONE_MATCH_ENABLED } from './audio/plan'
 import { addFiles, exportAll, updateProfile } from './engine'
 import { player } from './player'
-import { isStale, planTrack, sameNames, setGlobal, useStore } from './store'
+import { planTrack, sameNames, setGlobal, useStore } from './store'
 import { EqBars, GainBar, ReductionBar } from './ui/EffectBars'
 import { Knob } from './ui/Knob'
 import { Transport } from './ui/Transport'
@@ -81,12 +81,10 @@ export const MainView = () => {
 
   const ready = tracks.filter(t => t.status === 'ready')
 
-  // Each track counts twice: once when read and analyzed, once when its gain has been measured.
   const active = tracks.filter(t => t.status !== 'error')
   const loading = active.filter(t => t.status === 'loading').length
-  const pending = ready.filter(t => isStale({ global, profile }, t)).length
-  const busy = loading + pending > 0
-  const progress = active.length ? 1 - (2 * loading + pending) / (2 * active.length) : 1
+  const busy = loading > 0
+  const progress = active.length ? 1 - loading / active.length : 1
 
   const readyNames = ready.map(t => t.name)
 
@@ -134,23 +132,25 @@ export const MainView = () => {
           >
             <ReductionBar active={playing} />
           </Knob>
-          <Knob
-            label="Tone match"
-            value={global.toneMatch}
-            min={0}
-            max={1}
-            step={0.05}
-            defaultValue={DEFAULT_GLOBAL.toneMatch}
-            format={v => `${Math.round(v * 100)}%`}
-            onChange={toneMatch => setGlobal({ toneMatch })}
-          >
-            <EqBars gains={currentPlan?.plan.eq ?? null} />
-          </Knob>
+          {TONE_MATCH_ENABLED && (
+            <Knob
+              label="Tone match"
+              value={global.toneMatch}
+              min={0}
+              max={1}
+              step={0.05}
+              defaultValue={DEFAULT_GLOBAL.toneMatch}
+              format={v => `${Math.round(v * 100)}%`}
+              onChange={toneMatch => setGlobal({ toneMatch })}
+            >
+              <EqBars gains={currentPlan?.plan.eq ?? null} />
+            </Knob>
+          )}
         </section>
 
         {busy && (
           <div className="mb-4 flex items-center gap-3 text-xs" role="status">
-            <span className="text-muted w-20 shrink-0">{loading > 0 ? 'Analyzing' : 'Updating'}</span>
+            <span className="text-muted w-20 shrink-0">Analyzing</span>
             <div className="bg-raised h-1 flex-1 overflow-hidden rounded-full">
               <div
                 className="bg-accent h-full transition-[width] duration-300"
@@ -161,7 +161,7 @@ export const MainView = () => {
           </div>
         )}
 
-        {profileDiffers && !loading && (
+        {TONE_MATCH_ENABLED && profileDiffers && !loading && (
           <div className="text-muted mb-4 flex flex-wrap items-center justify-between gap-3 text-xs">
             <span>Tone reference: last export ({profile.names.length} tracks)</span>
             {readyNames.length >= 2 && (

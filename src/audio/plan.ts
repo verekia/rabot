@@ -2,6 +2,7 @@
 // the preview graph and the export render are both built from the same Plan.
 
 import type { Biquad } from './loudness'
+import type { Signature } from './model'
 import { BANDS, biquadPower, MID_BAND, SPECTRUM_BINS, spectrumBinHz } from './spectrum'
 
 export const SAMPLE_RATE = 44100
@@ -11,25 +12,17 @@ export const SAMPLE_RATE = 44100
 export const REFERENCE_LUFS = -18
 export const CEILING_DBTP = -1
 export const HIGHPASS_HZ = 25
+// Web Audio reads a high-pass Q in dB: −3.01 dB is a flat Butterworth response (Q 0.707). A linear 0.707
+// here would mean Q ≈ 1.08, a resonant bump right above the cutoff.
+export const HIGHPASS_Q_DB = 20 * Math.log10(Math.SQRT1_2)
 
 export type GlobalSettings = { target: number; dynamics: number; toneMatch: number }
 
-export const DEFAULT_GLOBAL: GlobalSettings = { target: -11, dynamics: 0.5, toneMatch: 0.5 }
+export const DEFAULT_GLOBAL: GlobalSettings = { target: -11, dynamics: 0, toneMatch: 0 }
 
-export type RawAnalysis = { lufs: number; truePeak: number }
-// Measured on the output of the dynamics stage (before tone EQ and post gain), for the plan `key`.
-// `bands` feed tone match; `spectrum` gives the EQ's exact loudness change without re-rendering.
-// `makeup` compensates the loudness the limiter removes when it has real work to do, measured on a full
-// render for the EQ + gain identified by `makeupFor`.
-export type StageAnalysis = {
-  key: string
-  lufs: number
-  truePeak: number
-  bands: number[]
-  spectrum: Float32Array
-  makeup: number
-  makeupFor: string | null
-}
+// Tone match is disabled for now (likely to be dropped): the EQ stays flat whatever `toneMatch` says, and
+// its dial is hidden. The code is kept so it can be turned back on by flipping this flag.
+export const TONE_MATCH_ENABLED = false
 
 export type FilterType = 'lowshelf' | 'highshelf' | 'peaking'
 export type ToneFilter = { type: FilterType; frequency: number; Q: number; band: number }
@@ -50,7 +43,7 @@ export type Plan = {
   preGain: number
   eq: number[]
   comp: CompressorParams
-  // Identity of the measured stage (pre gain + dynamics); a stage analysis is valid only for a matching key.
+  // Identity of the processing (used to tell whether an export matches the current dials).
   key: string
 }
 
@@ -159,6 +152,41 @@ const filterResponse = (index: number, gainDb: number) => {
   return response
 }
 
+// The high-pass at the start of the chain, per the Web Audio formula (Q in dB).
+const highpassBiquad = (): Biquad => {
+  const w0 = (2 * Math.PI * HIGHPASS_HZ) / SAMPLE_RATE
+  const cos = Math.cos(w0)
+  const alpha = Math.sin(w0) / (2 * 10 ** (HIGHPASS_Q_DB / 20))
+  const a0 = 1 + alpha
+  return {
+    b0: (1 + cos) / 2 / a0,
+    b1: -(1 + cos) / a0,
+    b2: (1 + cos) / 2 / a0,
+    a1: (-2 * cos) / a0,
+    a2: (1 - alpha) / a0,
+  }
+}
+
+// Loudness change (dB) of the fixed high-pass on a track, from its spectrum. Small (it cuts below the
+// K-weighting's own low-frequency roll-off) but not zero on bass-heavy material.
+const highpassCache = new WeakMap<Float32Array, number>()
+export const highpassLoudnessDelta = (spectrum: Float32Array) => {
+  const cached = highpassCache.get(spectrum)
+  if (cached !== undefined) return cached
+  const hp = highpassBiquad()
+  let num = 0
+  let den = 0
+  for (let k = 0; k < spectrum.length; k++) {
+    const s = spectrum[k]!
+    if (s <= 0) continue
+    den += s
+    num += s * biquadPower(hp, spectrumBinHz(k, SAMPLE_RATE), SAMPLE_RATE)
+  }
+  const delta = den > 0 ? 10 * Math.log10(num / den) : 0
+  highpassCache.set(spectrum, delta)
+  return delta
+}
+
 export const eqLoudnessDelta = (gains: number[], spectrum: Float32Array) => {
   const responses = gains.map((g, i) => filterResponse(i, g))
   let num = 0
@@ -190,57 +218,14 @@ export const compressorFor = (amount: number): CompressorParams => ({
 
 // --- Plan ------------------------------------------------------------------------------------------
 
-// Tone match needs the measured stage (its spectral balance); until then the EQ stays flat.
-export const makePlan = (
-  global: GlobalSettings,
-  raw: RawAnalysis,
-  stage: StageAnalysis | null,
-  reference: number[] | null,
-): Plan => {
-  const preGain = round(REFERENCE_LUFS - raw.lufs)
+export const makePlan = (global: GlobalSettings, sig: Signature, reference: number[] | null): Plan => {
+  const preGain = round(REFERENCE_LUFS - sig.lufs)
   const comp = compressorFor(global.dynamics)
   const desired = BANDS.map((_, b) =>
-    reference && stage && b !== MID_BAND
-      ? clamp((reference[b]! - stage.bands[b]!) * global.toneMatch, -MAX_CORRECTION_DB, MAX_CORRECTION_DB)
+    TONE_MATCH_ENABLED && reference && b !== MID_BAND
+      ? clamp((reference[b]! - sig.bands[b]!) * global.toneMatch, -MAX_CORRECTION_DB, MAX_CORRECTION_DB)
       : 0,
   )
   const eq = solveEq(desired).map(g => round(g, 0.05))
-  return { preGain, eq, comp, key: JSON.stringify({ preGain, comp }) }
-}
-
-// Limiting below this doesn't measurably lower the loudness, so no makeup render is needed.
-export const MAKEUP_THRESHOLD_DB = 0.5
-export const MAX_MAKEUP_DB = 6
-
-export type Gain = {
-  // Gain before makeup, and the full post gain.
-  base: number
-  gain: number
-  // How much the final limiter pulls the loudest peak down, in dB (null until measured).
-  limiting: number | null
-  // Identity of the EQ + gain a makeup measurement is valid for.
-  makeupKey: string
-  exact: boolean
-}
-
-// Gain after the dynamics + EQ stage. Exact once measured for this plan; until then the previous
-// measurement (or the reference level) is a close estimate, so the preview never jumps much.
-export const postGainFor = (global: GlobalSettings, plan: Plan, stage: StageAnalysis | null): Gain => {
-  const eqDelta = stage ? eqLoudnessDelta(plan.eq, stage.spectrum) : 0
-  const base = global.target - (stage ? stage.lufs + eqDelta : REFERENCE_LUFS)
-  const makeupKey = `${plan.eq.join(',')}|${base.toFixed(2)}`
-  // Peaks move with the EQ roughly like the loudness does.
-  const limiting = stage ? Math.max(0, stage.truePeak + eqDelta + base - CEILING_DBTP) : null
-  const makeupValid =
-    stage !== null &&
-    (stage.makeupFor !== null ? stage.makeupFor === makeupKey : (limiting ?? 0) <= MAKEUP_THRESHOLD_DB)
-  // No makeup when limiting is negligible; otherwise a stale makeup is the best estimate until re-measured.
-  const makeup = !stage || (stage.makeupFor === null && makeupValid) ? 0 : stage.makeup
-  return {
-    base,
-    gain: base + makeup,
-    limiting: limiting === null ? null : Math.max(0, limiting + makeup),
-    makeupKey,
-    exact: stage?.key === plan.key && makeupValid,
-  }
+  return { preGain, eq, comp, key: JSON.stringify({ preGain, eq, comp }) }
 }

@@ -1,6 +1,17 @@
 import { describe, expect, test } from 'bun:test'
 
-import { fromDb, integratedLoudness, kWeightingFilters, toDb, truePeak, type Biquad } from './loudness'
+import {
+  fromDb,
+  integratedLoudness,
+  kWeight,
+  kWeightingFilters,
+  loudnessFromSegments,
+  segmentLevels,
+  toDb,
+  truePeak,
+  type Biquad,
+} from './loudness'
+import { simulateDynamics, solveGain, type Signature } from './model'
 import {
   bandResponse,
   DEFAULT_GLOBAL,
@@ -9,8 +20,8 @@ import {
   referenceBands,
   solveEq,
   TONE_FILTERS,
+  TONE_MATCH_ENABLED,
   toneBiquad,
-  type StageAnalysis,
 } from './plan'
 import { analyzeSpectrum, SPECTRUM_BINS } from './spectrum'
 import { encodeWav24 } from './wav'
@@ -90,24 +101,26 @@ describe('tone match', () => {
     for (const b of [0, 1, 3, 4]) expect(achieved[b]!).toBeCloseTo(desired[b]!, 0)
   })
 
-  test('tracks move toward the playlist median', () => {
+  test('reference is the per-band median; the plan follows it only while tone match is enabled', () => {
     const bandsList = [
       [6, 0, 0, -6, -12],
       [0, 0, 0, -6, -12],
       [0, 0, 0, -6, -12],
     ]
     const ref = referenceBands(bandsList)!
-    const stage: StageAnalysis = {
-      key: '',
-      lufs: -18,
-      truePeak: -8,
+    expect(ref).toEqual([0, 0, 0, -6, -12])
+    const sig: Signature = {
+      lufs: -14,
+      truePeak: -1,
+      samplePeak: 0.9,
       bands: bandsList[0]!,
       spectrum: new Float32Array(SPECTRUM_BINS),
-      makeup: 0,
-      makeupFor: null,
+      power: new Float32Array(0),
+      peak: new Float32Array(0),
     }
-    const plan = makePlan({ ...DEFAULT_GLOBAL, toneMatch: 1 }, { lufs: -14, truePeak: -1 }, stage, ref)
-    expect(bandResponse(plan.eq)[0]!).toBeCloseTo(-6, 0)
+    const plan = makePlan({ ...DEFAULT_GLOBAL, toneMatch: 1 }, sig, ref)
+    if (TONE_MATCH_ENABLED) expect(bandResponse(plan.eq)[0]!).toBeCloseTo(-6, 0)
+    else expect(plan.eq.every(g => g === 0)).toBe(true)
     expect(plan.preGain).toBeCloseTo(-4)
   })
 
@@ -155,5 +168,46 @@ describe('wav', () => {
     const s = (o: number) => ((out[o]! | (out[o + 1]! << 8) | (out[o + 2]! << 16)) << 8) >> 8
     expect(s(44 + 3)).toBe(-0x7fffff)
     expect(s(44 + 6)).toBe(0x7fffff)
+  })
+})
+
+// Noise with loud and quiet sections, so gating matters.
+const noiseTrack = (seconds: number) => {
+  let seed = 7
+  const random = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1
+  return [0, 1].map(() => {
+    const x = new Float32Array(44100 * seconds)
+    // Loud and quiet sections so gating matters.
+    for (let i = 0; i < x.length; i++) x[i] = random() * (Math.floor(i / 44100) % 4 === 3 ? 0.02 : 0.3)
+    return x
+  })
+}
+
+describe('model', () => {
+  test('loudness from 10 ms segments matches BS.1770 on the samples', () => {
+    const channels = noiseTrack(12)
+    const { power } = segmentLevels(channels, kWeight(channels, 44100), 44100)
+    expect(loudnessFromSegments(power)).toBeCloseTo(integratedLoudness(channels, 44100), 2)
+  })
+
+  test('without compression or limiting the predicted gain is exact', () => {
+    const channels = noiseTrack(12)
+    const weighted = kWeight(channels, 44100)
+    const { power, peak } = segmentLevels(channels, weighted, 44100)
+    const lufs = integratedLoudness(channels, 44100)
+    const sig: Signature = {
+      lufs,
+      truePeak: toDb(truePeak(channels)),
+      samplePeak: Math.max(...peak),
+      bands: [0, 0, 0, 0, 0],
+      spectrum: new Float32Array(SPECTRUM_BINS),
+      power,
+      peak,
+    }
+    const noComp = { threshold: 0, ratio: 1, knee: 6, attack: 0.0015, release: 0.12 }
+    const d = simulateDynamics(sig, -18 - lufs, noComp)
+    const { gain, limiting } = solveGain(d, sig, 0, -20)
+    expect(limiting).toBe(0)
+    expect(gain).toBeCloseTo(-2, 2)
   })
 })

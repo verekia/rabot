@@ -1,15 +1,17 @@
-// Orchestration: loading files, keeping every track's loudness measurement in sync with the dials,
-// and exporting. UI components only call into here and read the store.
+// Orchestration: analyzing added files once, and exporting. The dials never trigger processing: the
+// preview is real-time and its gains are predicted from each track's signature (see audio/model.ts).
+// UI components only call into here and read the store.
 
 import { Zip, ZipPassThrough } from 'fflate'
 
-import { analyze, bufferChannels, CONCURRENCY } from './audio/analyzer'
+import { analyzeSignature, bufferChannels, CONCURRENCY, measure } from './audio/analyzer'
 import { renderChain } from './audio/chain'
-import { MAX_MAKEUP_DB, postGainFor, SAMPLE_RATE } from './audio/plan'
+import { fromDb } from './audio/loudness'
+import { CEILING_DBTP, SAMPLE_RATE } from './audio/plan'
 import { encodeWav24 } from './audio/wav'
 import { dropBuffer, getBuffer } from './buffers'
 import { player } from './player'
-import { isStale, planTrack, profileFromTracks, sameNames, updateTrack, useStore, type Track } from './store'
+import { planTrack, profileFromTracks, sameNames, updateTrack, useStore, type Track } from './store'
 
 const PEAK_BUCKETS = 800
 
@@ -44,15 +46,14 @@ export const addFiles = (files: File[]) => {
     error: null,
     duration: null,
     peaks: null,
-    raw: null,
-    stage: null,
+    signature: null,
     output: null,
   }))
   useStore.setState(s => ({ tracks: [...s.tracks, ...tracks], selectedId: s.selectedId ?? tracks[0]!.id }))
   schedule()
 }
 
-// Swap the source file of a track, keeping its position and per-track dials.
+// Swap the source file of a track, keeping its position.
 export const replaceFile = (id: string, file: File) => {
   if (!isAudio(file)) return
   if (useStore.getState().playingId === id) player.stop()
@@ -63,8 +64,7 @@ export const replaceFile = (id: string, file: File) => {
     error: null,
     duration: null,
     peaks: null,
-    raw: null,
-    stage: null,
+    signature: null,
     output: null,
   })
   dropBuffer(id)
@@ -82,108 +82,38 @@ export const removeTrack = (id: string) => {
   })
 }
 
-// --- Processing ------------------------------------------------------------------------------------
-// Each track gets one job at a time that does whatever it's missing, decoding the file once:
-//  1. input analysis (loudness, true peak): the track becomes playable;
-//  2. stage render (pre gain, high-pass, dynamics) + analysis (loudness, true peak, spectrum). The tone
-//     EQ's loudness change is computed from that spectrum, so tone changes never need a re-render;
-//  3. makeup, only when the limiter has real work to do: it also shaves some loudness, so the full chain
-//     is rendered and the gain corrected until the output lands on target.
-// Up to CONCURRENCY jobs run in parallel: decoding, offline rendering and analysis each use their own
-// threads.
+// --- Analysis --------------------------------------------------------------------------------------
+// Each added (or replaced) track is decoded and analyzed once into its signature. Up to CONCURRENCY
+// tracks are analyzed in parallel: decoding and analysis each use their own threads.
 
 const fileOf = (id: string) => useStore.getState().tracks.find(t => t.id === id)?.file
-const errorMessage = (e: unknown) => (e instanceof Error ? e.message : 'Could not process this file')
 
-const computeMakeup = async (buffer: AudioBuffer, id: string, file: File) => {
-  const state = useStore.getState()
-  const track = state.tracks.find(t => t.id === id)
-  const tp = track && planTrack(state, track)
-  if (!track?.stage || !tp || tp.exact || track.stage.key !== tp.plan.key) return
-  const reset = { ...track.stage, makeup: 0, makeupFor: null }
-  const atBase = postGainFor(state.global, tp.plan, reset)
-  if (atBase.exact) {
-    // Limiting became negligible: no makeup needed anymore.
-    updateTrack(id, { stage: reset })
-    return
-  }
-  // Secant iterations: under heavy limiting each dB of gain adds less than a dB of loudness.
-  const goal = state.global.target
-  let makeup = 0
-  let slope = 1
-  let previous: { makeup: number; lufs: number } | null = null
-  for (let i = 0; i < 6; i++) {
-    const rendered = await renderChain(buffer, tp.plan, atBase.base + makeup, 'full')
-    const r = await analyze(rendered, SAMPLE_RATE, false)
-    const error = goal - r.lufs
-    if (Math.abs(error) < 0.05) break
-    if (previous && makeup !== previous.makeup) {
-      slope = Math.min(1, Math.max(0.2, (r.lufs - previous.lufs) / (makeup - previous.makeup)))
-    }
-    previous = { makeup, lufs: r.lufs }
-    makeup = Math.min(MAX_MAKEUP_DB, makeup + error / slope)
-  }
-  if (fileOf(id) === file) updateTrack(id, { stage: { ...track.stage, makeup, makeupFor: atBase.makeupKey } })
-}
-
-const processTrack = async (id: string, { makeup = true } = {}) => {
-  const initial = useStore.getState().tracks.find(t => t.id === id)
-  if (!initial) return
-  const file = initial.file
+const analyzeTrack = async (id: string) => {
+  const file = fileOf(id)
+  if (!file) return
   try {
     const buffer = await getBuffer(id, file)
     if (fileOf(id) !== file) return
-
-    if (!initial.raw) {
-      const peaks = computePeaks(buffer)
-      const r = await analyze(bufferChannels(buffer), SAMPLE_RATE, false)
-      if (fileOf(id) !== file) return
-      if (!Number.isFinite(r.lufs)) throw new Error('This file is silent')
-      updateTrack(id, {
-        status: 'ready',
-        duration: buffer.duration,
-        peaks,
-        raw: { lufs: r.lufs, truePeak: r.truePeak },
-      })
-    }
-
-    const state = useStore.getState()
-    const track = state.tracks.find(t => t.id === id)
-    const tp = track && planTrack(state, track)
-    if (!track || !tp) return
-    if (track.stage?.key !== tp.plan.key) {
-      const rendered = await renderChain(buffer, tp.plan, 0, 'stage')
-      const r = await analyze(rendered, SAMPLE_RATE, true)
-      if (fileOf(id) !== file) return
-      updateTrack(id, {
-        stage: {
-          key: tp.plan.key,
-          lufs: r.lufs,
-          truePeak: r.truePeak,
-          bands: r.bands!,
-          spectrum: r.spectrum!,
-          makeup: track.stage?.makeup ?? 0,
-          makeupFor: null,
-        },
-      })
-      syncProfile()
-    }
-
-    if (makeup) await computeMakeup(buffer, id, file)
+    const peaks = computePeaks(buffer)
+    const signature = await analyzeSignature(bufferChannels(buffer), SAMPLE_RATE)
+    if (fileOf(id) !== file) return
+    if (!Number.isFinite(signature.lufs)) throw new Error('This file is silent')
+    updateTrack(id, { status: 'ready', duration: buffer.duration, peaks, signature })
+    syncProfile()
   } catch (e) {
-    if (fileOf(id) === file) updateTrack(id, { status: 'error', error: errorMessage(e) })
+    if (fileOf(id) === file) {
+      updateTrack(id, { status: 'error', error: e instanceof Error ? e.message : 'Could not read this file' })
+    }
   }
 }
 
 // Until the first export the tone reference follows the tracks; once locked it only changes on request.
-const sameBands = (a: number[], b: number[]) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]!) < 1e-6)
-
 const syncProfile = () => {
   const { tracks, profile } = useStore.getState()
   if (profile?.locked) return
   const next = profileFromTracks(tracks, false)
   if (!profile && !next) return
-  if (profile && next && sameNames(profile.names, next.names) && sameBands(profile.bands, next.bands)) return
+  if (profile && next && sameNames(profile.names, next.names)) return
   useStore.setState({ profile: next })
 }
 
@@ -198,85 +128,76 @@ const lockProfile = () => {
   if (profile && !profile.locked) useStore.setState({ profile: { ...profile, locked: true } })
 }
 
-const running = new Map<string, Promise<void>>()
-
-const startJob = (id: string, options?: { makeup?: boolean }) => {
-  const existing = running.get(id)
-  if (existing) return existing
-  const job = processTrack(id, options).finally(() => {
-    running.delete(id)
-    schedule()
-  })
-  running.set(id, job)
-  return job
-}
+const running = new Set<string>()
 
 const pump = () => {
   syncProfile()
-  const state = useStore.getState()
-  const anyLoading = state.tracks.some(t => t.status === 'loading')
-  const needsWork = (t: Track) => {
-    if (running.has(t.id)) return false
-    if (t.status === 'loading') return true
-    if (t.status !== 'ready' || !isStale(state, t)) return false
-    const tp = planTrack(state, t)
-    // Stage renders run right away; makeup waits until the set (and so the tone reference) is complete.
-    return t.stage?.key !== tp?.plan.key || !anyLoading
-  }
-  const candidates = state.tracks.filter(needsWork)
-  const priority = (t: Track) => (t.id === state.playingId ? 0 : t.id === state.selectedId ? 1 : 2)
-  candidates.sort((a, b) => priority(a) - priority(b))
-  for (const t of candidates) {
+  const { tracks, playingId, selectedId } = useStore.getState()
+  const waiting = tracks.filter(t => t.status === 'loading' && !running.has(t.id))
+  const priority = (t: Track) => (t.id === playingId ? 0 : t.id === selectedId ? 1 : 2)
+  waiting.sort((a, b) => priority(a) - priority(b))
+  for (const t of waiting) {
     if (running.size >= CONCURRENCY) break
-    void startJob(t.id, { makeup: !anyLoading })
+    running.add(t.id)
+    void analyzeTrack(t.id).finally(() => {
+      running.delete(t.id)
+      schedule()
+    })
   }
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null
 const schedule = () => {
   if (timer) clearTimeout(timer)
-  timer = setTimeout(pump, 100)
+  timer = setTimeout(pump, 50)
 }
 
 let lastTracks: Track[] | null = null
-let lastGlobal: unknown = null
-let lastProfile: unknown = null
 useStore.subscribe(state => {
-  if (state.tracks === lastTracks && state.global === lastGlobal && state.profile === lastProfile) return
+  if (state.tracks === lastTracks) return
   lastTracks = state.tracks
-  lastGlobal = state.global
-  lastProfile = state.profile
   schedule()
 })
 
 // --- Export ----------------------------------------------------------------------------------------
+// Only here is the full audio processed: rendered through the chain and measured. If the prediction
+// missed the target by more than 0.05 dB, the result is corrected: by simply scaling the rendered audio
+// when that can't push peaks into the limiter (the common case), otherwise by re-rendering with a
+// corrected gain (secant steps, since the limiter makes each dB of gain worth less than a dB).
 
-const ensureMeasured = async (id: string) => {
-  for (let i = 0; i < 4; i++) {
-    const state = useStore.getState()
-    const track = state.tracks.find(t => t.id === id)
-    if (!track || !isStale(state, track)) return
-    await (running.get(id) ?? startJob(id, { makeup: true }))
-  }
-}
+const TOLERANCE_DB = 0.05
 
 const renderWav = async (id: string) => {
-  lockProfile()
-  await ensureMeasured(id)
   const state = useStore.getState()
   const track = state.tracks.find(t => t.id === id)!
   const tp = planTrack(state, track)!
+  const target = state.global.target
   const buffer = await getBuffer(track.id, track.file)
-  // Render, verify what we're shipping, and correct the gain if it missed the target.
   let gain = tp.postGain
-  let channels = await renderChain(buffer, tp.plan, gain, 'full')
-  let r = await analyze(channels, SAMPLE_RATE, false)
-  for (let i = 0; i < 2 && Math.abs(state.global.target - r.lufs) > 0.05; i++) {
-    gain += state.global.target - r.lufs
-    channels = await renderChain(buffer, tp.plan, gain, 'full')
-    r = await analyze(channels, SAMPLE_RATE, false)
+  let channels = await renderChain(buffer, tp.plan, gain)
+  let result = await measure(channels, SAMPLE_RATE)
+  let previous: { gain: number; lufs: number } | null = null
+  for (let i = 0; i < 3; i++) {
+    const error = target - result.lufs
+    if (Math.abs(error) <= TOLERANCE_DB) break
+    if (error < 0 || result.truePeak + error <= CEILING_DBTP) {
+      // Linear correction: turning down is always clean, and turning up is clean while the true peak
+      // stays under the ceiling.
+      const scale = fromDb(error)
+      for (const ch of channels) for (let k = 0; k < ch.length; k++) ch[k] = ch[k]! * scale
+      result = { lufs: result.lufs + error, truePeak: result.truePeak + error }
+      break
+    }
+    const slope =
+      previous && gain !== previous.gain
+        ? Math.min(1, Math.max(0.2, (result.lufs - previous.lufs) / (gain - previous.gain)))
+        : 1
+    previous = { gain, lufs: result.lufs }
+    gain += error / slope
+    channels = await renderChain(buffer, tp.plan, gain)
+    result = await measure(channels, SAMPLE_RATE)
   }
-  updateTrack(id, { output: { key: tp.plan.key, postGain: tp.postGain, lufs: r.lufs, truePeak: r.truePeak } })
+  updateTrack(id, { output: { key: tp.key, lufs: result.lufs, truePeak: result.truePeak } })
   return encodeWav24(channels, SAMPLE_RATE)
 }
 
@@ -297,6 +218,7 @@ export const exportTrack = async (id: string) => {
   if (useStore.getState().exporting) return
   const track = useStore.getState().tracks.find(t => t.id === id)
   if (!track || track.status !== 'ready') return
+  lockProfile()
   useStore.setState({ exporting: { done: 0, total: 1 } })
   try {
     const wav = await renderWav(id)
@@ -309,6 +231,7 @@ export const exportTrack = async (id: string) => {
 export const exportAll = async () => {
   const tracks = exportable()
   if (tracks.length === 0 || useStore.getState().exporting) return
+  lockProfile()
   useStore.setState({ exporting: { done: 0, total: tracks.length } })
   try {
     const parts: Blob[] = []
@@ -319,9 +242,18 @@ export const exportAll = async () => {
       parts.push(new Blob([chunk as Uint8Array<ArrayBuffer>]))
       if (final) finished()
     })
+    // Render several tracks at once, but add them to the zip in order, holding at most CONCURRENCY
+    // finished files in memory.
+    const renders: Array<Promise<Uint8Array> | null> = tracks.map(() => null)
+    const start = (i: number) => {
+      if (i < tracks.length && !renders[i]) renders[i] = renderWav(tracks[i]!.id)
+    }
+    for (let i = 0; i < CONCURRENCY; i++) start(i)
     const used = new Set<string>()
     for (const [i, track] of tracks.entries()) {
-      const wav = await renderWav(track.id)
+      const wav = await renders[i]!
+      renders[i] = null
+      start(i + CONCURRENCY)
       let name = wavName(track.name)
       for (let n = 2; used.has(name); n++) name = wavName(`${track.name.replace(/\.[^.]+$/, '')} (${n})`)
       used.add(name)
@@ -341,5 +273,7 @@ export const exportAll = async () => {
 
 // Dev-only handle for poking at the pipeline from the console.
 if (process.env.NODE_ENV === 'development') {
-  Object.assign(window, { __rabot: { useStore, planTrack, renderChain, analyze, exportAll, exportTrack, player } })
+  Object.assign(window, {
+    __rabot: { useStore, planTrack, renderChain, measure, getBuffer, exportAll, exportTrack, player },
+  })
 }

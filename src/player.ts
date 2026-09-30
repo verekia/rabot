@@ -34,8 +34,8 @@ const getContext = async () => {
 // peaks stay below 0 dBFS and don't clip the output.
 const originalGainDb = (track: Track) => {
   const { global } = useStore.getState()
-  if (!track.raw) return 0
-  return Math.min(global.target - track.raw.lufs, -track.raw.truePeak)
+  if (!track.signature) return 0
+  return Math.min(global.target - track.signature.lufs, -track.signature.truePeak)
 }
 
 const applyMix = (v: Voice, c: AudioContext) => {

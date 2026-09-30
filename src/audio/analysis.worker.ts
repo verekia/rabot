@@ -1,28 +1,40 @@
 /// <reference lib="webworker" />
-import { integratedLoudness, toDb, truePeak } from './loudness'
+import { integratedLoudness, integratedLoudnessWeighted, kWeight, segmentLevels, toDb, truePeak } from './loudness'
+import type { Signature } from './model'
 import { analyzeSpectrum } from './spectrum'
 
-export type AnalysisRequest = { id: number; channels: Float32Array[]; sampleRate: number; spectrum: boolean }
-export type AnalysisResponse = {
-  id: number
-  lufs: number
-  truePeak: number
-  bands: number[] | null
-  spectrum: Float32Array | null
-}
+// 'signature': everything the model needs, measured once per track on add.
+// 'verify': loudness + true peak of a rendered export.
+export type AnalysisRequest = { id: number; kind: 'signature' | 'verify'; channels: Float32Array[]; sampleRate: number }
+export type AnalysisResponse =
+  | { id: number; kind: 'signature'; signature: Signature }
+  | { id: number; kind: 'verify'; lufs: number; truePeak: number }
 
 const scope = self as unknown as DedicatedWorkerGlobalScope
 
-scope.addEventListener('message', (e: MessageEvent<AnalysisRequest>) => {
-  const { id, channels, sampleRate, spectrum } = e.data
-  const s = spectrum ? analyzeSpectrum(channels, sampleRate) : null
-  const response: AnalysisResponse = {
-    id,
-    lufs: integratedLoudness(channels, sampleRate),
+const signatureOf = (channels: Float32Array[], sampleRate: number): Signature => {
+  const weighted = kWeight(channels, sampleRate)
+  const { power, peak } = segmentLevels(channels, weighted, sampleRate)
+  const { bands, spectrum } = analyzeSpectrum(channels, sampleRate)
+  let samplePeak = 0
+  for (let i = 0; i < peak.length; i++) if (peak[i]! > samplePeak) samplePeak = peak[i]!
+  return {
+    lufs: integratedLoudnessWeighted(weighted, sampleRate),
     truePeak: toDb(truePeak(channels)),
-    bands: s?.bands ?? null,
-    spectrum: s?.spectrum ?? null,
+    samplePeak,
+    bands,
+    spectrum,
+    power,
+    peak,
   }
+}
+
+scope.addEventListener('message', (e: MessageEvent<AnalysisRequest>) => {
+  const { id, kind, channels, sampleRate } = e.data
+  const response: AnalysisResponse =
+    kind === 'signature'
+      ? { id, kind, signature: signatureOf(channels, sampleRate) }
+      : { id, kind, lufs: integratedLoudness(channels, sampleRate), truePeak: toDb(truePeak(channels)) }
   // Worker scope postMessage takes no target origin (the rule assumes window.postMessage).
   // oxlint-disable-next-line unicorn/require-post-message-target-origin
   scope.postMessage(response)

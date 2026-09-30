@@ -174,7 +174,6 @@ class TruePeakLimiter extends AudioWorkletProcessor {
     // Largest possible gain of the interpolator: if every sample in the window is below ceiling / bound,
     // no inter-sample peak can reach the ceiling and the oversampling can be skipped.
     this.bound = Math.max(...this.phases.map(t => t.reduce((a, v) => a + Math.abs(v), 0)))
-    this.channels = 2
     // Each history is stored twice so the FIR reads a contiguous run without wrapping.
     this.history = [new Float64Array(2 * TAPS), new Float64Array(2 * TAPS)]
     this.histPos = 0
@@ -203,82 +202,124 @@ class TruePeakLimiter extends AudioWorkletProcessor {
     if (!this.alive) return false
     if (!output || output.length === 0) return true
     const frames = output[0].length
-    const phases = this.phases
-    for (let i = 0; i < frames; i++) {
-      // Detector: newest sample into history, estimate the peak around sample n - HALF.
-      let peak = 0
-      const pos = this.histPos
-      for (let c = 0; c < this.channels; c++) {
-        const src = input && input.length > 0 ? input[Math.min(c, input.length - 1)] : null
-        const x = src ? src[i] : 0
-        const h = this.history[c]
-        h[pos] = x
-        h[pos + TAPS] = x
-        const newest = pos + TAPS
-        // Phase 0 is exactly the sample HALF frames ago; phases 1-3 are the inter-sample points after it.
-        const s0 = h[newest - HALF]
-        let a = s0 < 0 ? -s0 : s0
-        if (a > peak) peak = a
-        let windowMax = 0
-        for (let k = 0; k < TAPS; k++) {
-          const v = h[newest - k]
-          const av = v < 0 ? -v : v
-          if (av > windowMax) windowMax = av
-        }
-        if (windowMax * this.bound <= this.ceiling) continue
-        for (let p = 1; p < OVERSAMPLE; p++) {
-          const taps = phases[p]
-          let acc = 0
-          for (let k = 0; k < TAPS; k++) acc += taps[k] * h[newest - k]
-          a = acc < 0 ? -acc : acc
-          if (a > peak) peak = a
-        }
-      }
-      this.histPos = (pos + 1) % TAPS
+    const inL = input && input.length > 0 ? input[0] : null
+    const inR = input && input.length > 1 ? input[1] : inL
+    const outL = output[0]
+    const outR = output.length > 1 ? output[1] : null
+    // State lives in locals during the loop (much faster than property access per sample).
+    const [, p1, p2, p3] = this.phases
+    const hL = this.history[0]
+    const hR = this.history[1]
+    const lineL = this.delayLines[0]
+    const lineR = this.delayLines[1]
+    const holdRing = this.holdRing
+    const boxRing = this.boxRing
+    const window = this.window
+    const ceiling = this.ceiling
+    const skipBelow = ceiling / this.bound
+    const releaseMul = this.releaseMul
+    const delaySize = this.delay + 1
+    let histPos = this.histPos
+    let ringPos = this.ringPos
+    let delayPos = this.delayPos
+    let holdMin = this.holdMin
+    let holdAge = this.holdAge
+    let released = this.released
+    let boxSum = this.boxSum
+    let minGain = this.minGain
 
-      const required = peak > this.ceiling ? this.ceiling / peak : 1
+    // Estimated true peak around sample n - HALF of one channel's history: the sample itself, plus the
+    // three inter-sample points after it unless the whole window is too quiet to reach the ceiling.
+    const channelPeak = (h, newest) => {
+      const s0 = h[newest - HALF]
+      let peak = s0 < 0 ? -s0 : s0
+      let windowMax = 0
+      for (let k = 0; k < TAPS; k++) {
+        const v = h[newest - k]
+        const av = v < 0 ? -v : v
+        if (av > windowMax) windowMax = av
+      }
+      if (windowMax <= skipBelow) return peak
+      let a1 = 0
+      let a2 = 0
+      let a3 = 0
+      for (let k = 0; k < TAPS; k++) {
+        const v = h[newest - k]
+        a1 += p1[k] * v
+        a2 += p2[k] * v
+        a3 += p3[k] * v
+      }
+      if (a1 < 0) a1 = -a1
+      if (a2 < 0) a2 = -a2
+      if (a3 < 0) a3 = -a3
+      if (a1 > peak) peak = a1
+      if (a2 > peak) peak = a2
+      if (a3 > peak) peak = a3
+      return peak
+    }
+
+    for (let i = 0; i < frames; i++) {
+      const xl = inL ? inL[i] : 0
+      const xr = inR ? inR[i] : 0
+      hL[histPos] = xl
+      hL[histPos + TAPS] = xl
+      hR[histPos] = xr
+      hR[histPos + TAPS] = xr
+      const newest = histPos + TAPS
+      const pl = channelPeak(hL, newest)
+      const pr = channelPeak(hR, newest)
+      const peak = pl > pr ? pl : pr
+      histPos = histPos + 1 === TAPS ? 0 : histPos + 1
+
+      const required = peak > ceiling ? ceiling / peak : 1
 
       // Min-hold over the lookahead window (rescan only when the current minimum ages out).
-      this.holdRing[this.ringPos] = required
-      if (required <= this.holdMin) {
-        this.holdMin = required
-        this.holdAge = 0
-      } else if (++this.holdAge >= this.window) {
+      holdRing[ringPos] = required
+      if (required <= holdMin) {
+        holdMin = required
+        holdAge = 0
+      } else if (++holdAge >= window) {
         let min = 1
         let age = 0
-        for (let k = 0; k < this.window; k++) {
-          const idx = (this.ringPos - k + this.window) % this.window
-          if (this.holdRing[idx] < min) {
-            min = this.holdRing[idx]
+        for (let k = 0; k < window; k++) {
+          const idx = ringPos - k < 0 ? ringPos - k + window : ringPos - k
+          if (holdRing[idx] < min) {
+            min = holdRing[idx]
             age = k
           }
         }
-        this.holdMin = min
-        this.holdAge = age
+        holdMin = min
+        holdAge = age
       }
-      const hold = this.holdMin
 
       // Exponential release, never above the hold.
-      const release = 1 - (1 - this.released) * this.releaseMul
-      this.released = hold < release ? hold : release
+      const release = 1 - (1 - released) * releaseMul
+      released = holdMin < release ? holdMin : release
 
       // Box smoothing over the same window.
-      this.boxSum += this.released - this.boxRing[this.ringPos]
-      this.boxRing[this.ringPos] = this.released
-      this.ringPos = (this.ringPos + 1) % this.window
-      const gain = Math.min(1, this.boxSum / this.window)
-      if (gain < this.minGain) this.minGain = gain
+      boxSum += released - boxRing[ringPos]
+      boxRing[ringPos] = released
+      ringPos = ringPos + 1 === window ? 0 : ringPos + 1
+      const gain = boxSum / window < 1 ? boxSum / window : 1
+      if (gain < minGain) minGain = gain
 
       // Audio path: delay then apply gain.
-      const readPos = (this.delayPos + 1) % (this.delay + 1)
-      for (let c = 0; c < output.length; c++) {
-        const line = this.delayLines[Math.min(c, 1)]
-        const src = input && input.length > 0 ? input[Math.min(c, input.length - 1)] : null
-        if (c < 2) line[this.delayPos] = src ? src[i] : 0
-        output[c][i] = line[readPos] * gain
-      }
-      this.delayPos = readPos
+      const readPos = delayPos + 1 === delaySize ? 0 : delayPos + 1
+      lineL[delayPos] = xl
+      lineR[delayPos] = xr
+      outL[i] = lineL[readPos] * gain
+      if (outR) outR[i] = lineR[readPos] * gain
+      delayPos = readPos
     }
+
+    this.histPos = histPos
+    this.ringPos = ringPos
+    this.delayPos = delayPos
+    this.holdMin = holdMin
+    this.holdAge = holdAge
+    this.released = released
+    this.boxSum = boxSum
+    this.minGain = minGain
 
     if (this.report) {
       this.reportCounter += frames

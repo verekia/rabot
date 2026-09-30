@@ -14,36 +14,39 @@ bun dev
 
 ## Controls
 
-Three dials, applied to every track:
+Two dials, applied to every track:
 
 - **Loudness**: the integrated loudness (LUFS, ITU-R BS.1770) every track is matched to.
 - **Dynamics**: tames transients that stick out above a track's own loudness, so percussive or
-  dynamic mixes get pulled in and already-dense masters are left alone.
-- **Tone match**: moves each track's spectral balance part of the way toward the set's median.
+  dynamic mixes get pulled in and already-dense masters are left alone. Off (0%) by default.
+
+Under each dial, a small bar shows what it's doing to the song that's playing (or selected): the gain
+applied, and the live transient reduction.
 
 Drag a dial vertically (hold Shift for fine steps), or use the arrow keys; double-click resets it.
 
 Keyboard shortcuts: Space plays or pauses, B toggles A/B (processed vs. the loudness-matched original),
 and ↑/↓ change the selected track. Playback continues into the next track, like the live set would.
 
-## Analysis
+## How it works
 
-When you add tracks, they're analyzed automatically, several at a time: loudness and peaks, then each one
-is measured through the dynamics stage along with its spectral balance. A progress bar shows where it's at;
-30 songs take about 20 seconds. You can preview right away. Loudness and Tone match changes apply
-instantly; a Dynamics change re-measures in the background ("Updating…") while the preview follows
-instantly.
+1. **On add (once per track):** each file is decoded and analyzed into a signature: its loudness, true
+   peak, spectrum, and a 10 ms level profile. Several tracks are analyzed at a time; 30 songs take about
+   8 seconds.
+2. **While you tweak:** nothing is re-rendered. The preview is real-time Web Audio processing, and each
+   track's gain for the loudness target is predicted from its signature by simulating the dynamics and
+   the limiter on the level profile. Every dial change is instant. The prediction is typically within
+   0.1–0.3 dB of the real result.
+3. **On export:** each track is rendered through the full chain, measured, and corrected if it missed the
+   target by more than 0.05 dB, so exported files are exact.
+
+Tone match (pulling each track's EQ toward the set's average) is disabled for now: the EQ stays flat.
 
 ## Replacing one song later
 
 Drop a single file on a track (or select it and click Replace) to swap its source, for example a better
-mix, while keeping its place. Then export only that one.
-
-The tone reference (the set's average spectral balance that Tone match pulls toward) follows your tracks
-until your first export. Then it's locked and saved in the browser, together with the dials. A song
-exported later, even alone and in another session, gets exactly the same processing as the rest of the
-set. When the current tracks differ from the reference, a notice says so, with a button to rebuild the
-reference from them instead.
+mix, while keeping its place. Then export only that one: with the same dials it gets the same processing
+as the rest of the set.
 
 ## Processing chain
 
@@ -55,12 +58,9 @@ decode → 44.1 kHz stereo → normalize to −18 LUFS → 25 Hz high-pass → d
    every track.
 2. **Dynamics**: stereo-linked lookahead (3 ms) peak compressor with a soft knee. Its threshold sits
    14 → 6 dB above the track's loudness depending on the dial.
-3. **Tone EQ**: low shelf, two peaking bands and a high shelf, solved so each band (bass, low mid,
-   presence, air) moves by the requested amount relative to the mids.
-4. **Gain**: after steps 1–2 the track is rendered offline and measured, including its spectrum. The tone
-   EQ's effect on loudness is computed exactly from that spectrum, and the gain to hit the loudness target
-   is applied. If the limiter has real work to do, the full chain is rendered again and the gain is
-   corrected until the output lands on target.
+3. **Tone EQ**: low shelf, two peaking bands and a high shelf (flat while tone match is disabled).
+4. **Gain**: brings the track to the loudness target (predicted while previewing, measured and corrected
+   on export).
 5. **Limiter**: lookahead true-peak limiter (4× oversampled detector) with a −1 dBTP ceiling. It
    doesn't overshoot or clip. A track shows its peak limiting only when it's 0.5 dB or more: green is
    inaudible, amber is fine, red means raise Dynamics or lower the Loudness target.

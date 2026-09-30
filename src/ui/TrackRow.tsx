@@ -3,7 +3,7 @@ import { useRef, useState, type DragEvent } from 'react'
 import { CEILING_DBTP } from '../audio/plan'
 import { exportTrack, removeTrack, replaceFile } from '../engine'
 import { player } from '../player'
-import { isStale, planTrack, useStore, type Track } from '../store'
+import { planTrack, useStore, type Track } from '../store'
 
 const db = (v: number, digits = 1) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(digits)}`
 
@@ -14,10 +14,8 @@ export const TrackRow = ({ track, index }: { track: Track; index: number }) => {
   const selected = state.selectedId === track.id
   const isPlaying = state.playing && state.playingId === track.id
   const tp = planTrack(state, track)
-  const stale = track.status === 'ready' && isStale(state, track)
   const limiting = tp?.limiting ?? null
-  const verified =
-    track.output && tp && track.output.key === tp.plan.key && Math.abs(track.output.postGain - tp.postGain) < 0.01
+  const verified = track.output !== null && tp !== null && track.output.key === tp.key
   const fileInput = useRef<HTMLInputElement>(null)
   const [dragOver, setDragOver] = useState(false)
 
@@ -31,8 +29,7 @@ export const TrackRow = ({ track, index }: { track: Track; index: number }) => {
     replaceFile(track.id, file)
   }
 
-  const status =
-    track.status === 'loading' ? 'Decoding…' : track.status === 'error' ? track.error : stale ? 'Measuring…' : null
+  const status = track.status === 'loading' ? 'Analyzing…' : track.status === 'error' ? track.error : null
 
   return (
     <li

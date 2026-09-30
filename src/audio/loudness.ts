@@ -49,13 +49,42 @@ const filterInPlace = (x: Float32Array, f: Biquad): Float32Array => {
 
 const powerToLufs = (p: number) => (p > 0 ? -0.691 + 10 * Math.log10(p) : -Infinity)
 
-// Integrated loudness in LUFS for a set of channels (L/R, weight 1 each).
-export const integratedLoudness = (channels: Float32Array[], sampleRate: number): number => {
+export const kWeight = (channels: Float32Array[], sampleRate: number) => {
   const [shelf, hp] = kWeightingFilters(sampleRate)
-  const weighted = channels.map(ch => filterInPlace(filterInPlace(ch, shelf), hp))
+  return channels.map(ch => filterInPlace(filterInPlace(ch, shelf), hp))
+}
+
+// BS.1770 gating over 400 ms block powers (K-weighted mean square, summed over channels).
+export const gatedLoudness = (blocks: ArrayLike<number>) => {
+  let absSum = 0
+  let absCount = 0
+  for (let i = 0; i < blocks.length; i++) {
+    if (powerToLufs(blocks[i]!) > -70) {
+      absSum += blocks[i]!
+      absCount++
+    }
+  }
+  if (absCount === 0) return -Infinity
+  const relThreshold = powerToLufs(absSum / absCount) - 10
+  let relSum = 0
+  let relCount = 0
+  for (let i = 0; i < blocks.length; i++) {
+    if (powerToLufs(blocks[i]!) > -70 && powerToLufs(blocks[i]!) > relThreshold) {
+      relSum += blocks[i]!
+      relCount++
+    }
+  }
+  return powerToLufs(relSum / relCount)
+}
+
+// Integrated loudness in LUFS for a set of channels (L/R, weight 1 each).
+export const integratedLoudness = (channels: Float32Array[], sampleRate: number): number =>
+  integratedLoudnessWeighted(kWeight(channels, sampleRate), sampleRate)
+
+export const integratedLoudnessWeighted = (weighted: Float32Array[], sampleRate: number): number => {
   const blockSize = Math.round(0.4 * sampleRate)
   const hop = Math.round(0.1 * sampleRate)
-  const length = channels[0]?.length ?? 0
+  const length = weighted[0]?.length ?? 0
   if (length < blockSize) {
     // Too short to gate properly: plain mean square.
     let sum = 0
@@ -66,7 +95,6 @@ export const integratedLoudness = (channels: Float32Array[], sampleRate: number)
     }
     return powerToLufs(sum)
   }
-
   // Prefix sums of squares per channel make each 400 ms block O(1).
   const prefix = weighted.map(ch => {
     const p = new Float64Array(ch.length + 1)
@@ -79,14 +107,54 @@ export const integratedLoudness = (channels: Float32Array[], sampleRate: number)
     for (const p of prefix) z += (p[start + blockSize]! - p[start]!) / blockSize
     blocks.push(z)
   }
+  return gatedLoudness(blocks)
+}
 
-  const absGated = blocks.filter(z => powerToLufs(z) > -70)
-  if (absGated.length === 0) return -Infinity
-  const absMean = absGated.reduce((a, b) => a + b, 0) / absGated.length
-  const relThreshold = powerToLufs(absMean) - 10
-  const relGated = absGated.filter(z => powerToLufs(z) > relThreshold)
-  const relMean = relGated.reduce((a, b) => a + b, 0) / relGated.length
-  return powerToLufs(relMean)
+// 10 ms segments: 400 ms blocks are exactly 40 segments and the 100 ms hop exactly 10, so loudness
+// computed from segment powers matches BS.1770 (at 44.1 kHz).
+export const SEGMENT_SECONDS = 0.01
+export const SEGMENTS_PER_BLOCK = 40
+export const SEGMENTS_PER_HOP = 10
+
+// Per segment: K-weighted mean square summed over channels, and the sample peak over channels.
+export const segmentLevels = (channels: Float32Array[], weighted: Float32Array[], sampleRate: number) => {
+  const size = Math.round(SEGMENT_SECONDS * sampleRate)
+  const count = Math.floor((channels[0]?.length ?? 0) / size)
+  const power = new Float32Array(count)
+  const peak = new Float32Array(count)
+  for (let s = 0; s < count; s++) {
+    let p = 0
+    let m = 0
+    for (let c = 0; c < channels.length; c++) {
+      const w = weighted[c]!
+      const x = channels[c]!
+      let sq = 0
+      for (let i = s * size; i < (s + 1) * size; i++) {
+        sq += w[i]! * w[i]!
+        const a = x[i]! < 0 ? -x[i]! : x[i]!
+        if (a > m) m = a
+      }
+      p += sq / size
+    }
+    power[s] = p
+    peak[s] = m
+  }
+  return { power, peak }
+}
+
+// Integrated loudness from segment powers (same gating as `integratedLoudness`).
+export const loudnessFromSegments = (power: ArrayLike<number>) => {
+  const prefix = new Float64Array(power.length + 1)
+  for (let i = 0; i < power.length; i++) prefix[i + 1] = prefix[i]! + power[i]!
+  const blocks: number[] = []
+  for (let start = 0; start + SEGMENTS_PER_BLOCK <= power.length; start += SEGMENTS_PER_HOP) {
+    blocks.push((prefix[start + SEGMENTS_PER_BLOCK]! - prefix[start]!) / SEGMENTS_PER_BLOCK)
+  }
+  if (blocks.length === 0) {
+    const mean = power.length ? prefix[power.length]! / power.length : 0
+    return powerToLufs(mean)
+  }
+  return gatedLoudness(blocks)
 }
 
 // 4x oversampling interpolator: windowed-sinc polyphase FIR, 12 taps per phase.

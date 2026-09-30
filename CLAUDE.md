@@ -29,22 +29,25 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
   4× interpolator must stay in sync with `interpolatorPhases` in `loudness.ts`.
 - `src/audio/loudness.ts`, `spectrum.ts`, `wav.ts`: **pure** DSP (BS.1770 loudness, true peak, band
   levels, WAV encoder), run in `analysis.worker.ts` and covered by `dsp.test.ts`.
-- `src/engine.ts`: processing jobs and export. Each track gets one job at a time (`processTrack`) that
-  decodes once and does what's missing: input analysis, then a stage render (pre gain → high-pass →
-  dynamics) analyzed for loudness, true peak and spectrum, then makeup renders only when the limiter works
-  hard. Up to `CONCURRENCY` jobs run in parallel (worker pool in `analyzer.ts`).
-- The tone EQ is **not** in the measured stage: its loudness change is computed from the stage's
-  per-channel K-weighted spectrum (`eqLoudnessDelta` in `plan.ts`, exact to ~0.01 dB and covered by a
-  test), so Tone match changes never re-render. Export still measures the real output and corrects the
-  gain if it misses the target by more than 0.05 dB.
-- The tone reference (`SetProfile` in the store) is the median of the tracks' stage bands. It follows the
-  tracks until the first export, then it's locked and persisted, so later single-track exports stay
-  consistent. Don't make it follow the tracks after that.
+- `src/audio/model.ts`: **pure**. The core of the interactivity: each track's `Signature` (loudness,
+  true peak, spectrum, 10 ms K-weighted power + sample peak per segment) is measured once on add, and the
+  dynamics stage + limiter are simulated on it (`simulateDynamics`, `solveGain`) to predict the post gain
+  for any dial setting. Dials must never trigger renders; keep the simulation in sync with the worklets'
+  gain curves and time constants.
+- `src/engine.ts`: analysis on add (`analyzeTrack`, up to `CONCURRENCY` in parallel via the worker pool in
+  `analyzer.ts`) and export. Only export renders full audio: render, measure, then correct by scaling
+  (when that can't push peaks into the limiter) or by re-rendering. Chrome runs all offline
+  AudioWorklet rendering on one thread, so parallel export renders don't help.
+- Linear filters (25 Hz high-pass, tone EQ) change loudness predictably: `eqLoudnessDelta` and
+  `highpassLoudnessDelta` in `plan.ts` compute it from the per-channel K-weighted spectrum.
+- Tone match is disabled (`TONE_MATCH_ENABLED = false` in `plan.ts`): the EQ stays flat and its dial is
+  hidden, but the code (profile, reference bands, EQ solver) is kept. The tone reference (`SetProfile` in
+  the store) follows the tracks until the first export, then it's locked and persisted.
 - `src/buffers.ts`: decoded audio isn't kept on tracks (about 85 MB per song). Always go through
   `getBuffer(id, file)`, a small LRU of decode promises. Tracks keep only `duration`, `peaks` and analyses.
 - `src/player.ts`: preview voice with a processed path and a loudness-matched original path for A/B.
-- `src/store.ts`: zustand store. The three global dials and the locked tone reference persist to
-  localStorage. There are deliberately no per-track settings: the same three dials apply to the whole set.
+- `src/store.ts`: zustand store. The global dials and the locked tone reference persist to
+  localStorage. There are deliberately no per-track settings: the same dials apply to the whole set.
 
 ## Gotchas
 
@@ -52,6 +55,8 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
   native node barely changes peak-to-loudness ratio, and it adds automatic makeup gain.
 - Dynamics sits **before** the tone EQ on purpose: its threshold is relative to the −18 LUFS normalized
   level, and EQ would shift that per track.
+- Web Audio reads a highpass/lowpass `Q` in dB (peaking filters take it linear). The high-pass uses
+  `HIGHPASS_Q_DB` (−3.01 dB = Butterworth); a linear 0.707 there adds a resonant bump.
 - Worklet processors return `true` from `process()` and so never die on their own. `Chain.disconnect()`
   sends them `{ stop: true }` so they return `false`; skipping that leaks a processor per play/seek and
   its stale meter reports overwrite the live ones.

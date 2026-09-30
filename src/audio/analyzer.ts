@@ -1,4 +1,5 @@
 import type { AnalysisRequest, AnalysisResponse } from './analysis.worker'
+import type { Signature } from './model'
 
 // Several tracks are analyzed at once, one worker each.
 export const CONCURRENCY = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 2) / 2)))
@@ -25,21 +26,34 @@ const leastBusy = () => {
   return pool.reduce((a, b) => (b.busy < a.busy ? b : a))
 }
 
-// Measures loudness + true peak (and optionally the spectrum) off the main thread. The channels are
-// copied, so callers can pass views into buffers they keep using.
-export const analyze = (channels: Float32Array[], sampleRate: number, spectrum: boolean): Promise<AnalysisResponse> => {
+const run = (kind: AnalysisRequest['kind'], channels: Float32Array[], sampleRate: number) => {
+  // Copies, so callers can pass views into buffers they keep using.
   const copies = channels.map(c => c.slice())
   const id = nextId++
   const slot = leastBusy()
   slot.busy++
-  return new Promise(resolve => {
+  return new Promise<AnalysisResponse>(resolve => {
     pending.set(id, { resolve, slot })
-    const request: AnalysisRequest = { id, channels: copies, sampleRate, spectrum }
+    const request: AnalysisRequest = { id, kind, channels: copies, sampleRate }
     slot.worker.postMessage(
       request,
       copies.map(c => c.buffer),
     )
   })
+}
+
+// A track's signature (loudness, spectrum, 10 ms level profile), computed off the main thread.
+export const analyzeSignature = async (channels: Float32Array[], sampleRate: number): Promise<Signature> => {
+  const r = await run('signature', channels, sampleRate)
+  if (r.kind !== 'signature') throw new Error('Unexpected analysis response')
+  return r.signature
+}
+
+// Loudness + true peak of rendered audio.
+export const measure = async (channels: Float32Array[], sampleRate: number) => {
+  const r = await run('verify', channels, sampleRate)
+  if (r.kind !== 'verify') throw new Error('Unexpected analysis response')
+  return { lufs: r.lufs, truePeak: r.truePeak }
 }
 
 export const bufferChannels = (buffer: AudioBuffer) =>
