@@ -1,8 +1,18 @@
 import { describe, expect, test } from 'bun:test'
 
-import { fromDb, integratedLoudness, kWeightingFilters, toDb, truePeak } from './loudness'
-import { bandResponse, makePlan, referenceBands, solveEq, DEFAULT_GLOBAL } from './plan'
-import { bandLevels } from './spectrum'
+import { fromDb, integratedLoudness, kWeightingFilters, toDb, truePeak, type Biquad } from './loudness'
+import {
+  bandResponse,
+  DEFAULT_GLOBAL,
+  eqLoudnessDelta,
+  makePlan,
+  referenceBands,
+  solveEq,
+  TONE_FILTERS,
+  toneBiquad,
+  type StageAnalysis,
+} from './plan'
+import { analyzeSpectrum, SPECTRUM_BINS } from './spectrum'
 import { encodeWav24 } from './wav'
 
 const sine = (hz: number, amplitude: number, seconds: number, sampleRate: number, phase = 0) =>
@@ -10,6 +20,24 @@ const sine = (hz: number, amplitude: number, seconds: number, sampleRate: number
     { length: Math.round(seconds * sampleRate) },
     (_, i) => amplitude * Math.sin((2 * Math.PI * hz * i) / sampleRate + phase),
   )
+
+// Direct-form biquad, same coefficients the Web Audio BiquadFilterNode uses.
+const filter = (x: Float32Array, f: Biquad) => {
+  const y = new Float32Array(x.length)
+  let x1 = 0,
+    x2 = 0,
+    y1 = 0,
+    y2 = 0
+  for (let i = 0; i < x.length; i++) {
+    const y0 = f.b0 * x[i]! + f.b1 * x1 + f.b2 * x2 - f.a1 * y1 - f.a2 * y2
+    y[i] = y0
+    x2 = x1
+    x1 = x[i]!
+    y2 = y1
+    y1 = y0
+  }
+  return y
+}
 
 describe('loudness', () => {
   test('K-weighting matches the BS.1770 coefficients at 48 kHz', () => {
@@ -51,7 +79,7 @@ describe('tone match', () => {
     const bass = sine(80, 0.5, 3, 44100)
     const mid = sine(1000, 0.05, 3, 44100)
     const mix = bass.map((v, i) => v + mid[i]!)
-    const levels = bandLevels([mix, mix], 44100)
+    const levels = analyzeSpectrum([mix, mix], 44100).bands
     expect(levels[0]!).toBeGreaterThan(15)
     expect(levels[2]!).toBe(0)
   })
@@ -63,15 +91,56 @@ describe('tone match', () => {
   })
 
   test('tracks move toward the playlist median', () => {
-    const analyses = [
-      { lufs: -14, truePeak: -1, bands: [6, 0, 0, -6, -12] },
-      { lufs: -14, truePeak: -1, bands: [0, 0, 0, -6, -12] },
-      { lufs: -14, truePeak: -1, bands: [0, 0, 0, -6, -12] },
+    const bandsList = [
+      [6, 0, 0, -6, -12],
+      [0, 0, 0, -6, -12],
+      [0, 0, 0, -6, -12],
     ]
-    const ref = referenceBands(analyses)!
-    const plan = makePlan({ ...DEFAULT_GLOBAL, toneMatch: 1 }, analyses[0]!, ref)
+    const ref = referenceBands(bandsList)!
+    const stage: StageAnalysis = {
+      key: '',
+      lufs: -18,
+      truePeak: -8,
+      bands: bandsList[0]!,
+      spectrum: new Float32Array(SPECTRUM_BINS),
+      makeup: 0,
+      makeupFor: null,
+    }
+    const plan = makePlan({ ...DEFAULT_GLOBAL, toneMatch: 1 }, { lufs: -14, truePeak: -1 }, stage, ref)
     expect(bandResponse(plan.eq)[0]!).toBeCloseTo(-6, 0)
     expect(plan.preGain).toBeCloseTo(-4)
+  })
+
+  test('EQ loudness change from the spectrum matches filtering and re-measuring', () => {
+    // Realistic stereo: independent pink-ish noise per channel (wide content) plus a shared bass sine
+    // (centered, like a kick or bass guitar). Loudness sums channel powers, so a mono-sum spectrum would
+    // over-weight the bass here.
+    const n = 44100 * 10
+    let seed = 1
+    const random = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1
+    const channel = () => {
+      const x = new Float32Array(n)
+      let lp = 0
+      for (let i = 0; i < n; i++) {
+        lp = 0.97 * lp + 0.03 * random()
+        x[i] = 0.3 * lp + 0.05 * random() + 0.15 * Math.sin((2 * Math.PI * 70 * i) / 44100)
+      }
+      return x
+    }
+    const stereo = [channel(), channel()]
+    const { spectrum } = analyzeSpectrum(stereo, 44100)
+    for (const gains of [
+      [4, -2, 3, -4],
+      [-6, 2, -3, 5],
+    ]) {
+      const eqd = stereo.map(ch => {
+        let y = ch
+        TONE_FILTERS.forEach((f, i) => (y = filter(y, toneBiquad(f, gains[i]!))))
+        return y
+      })
+      const actual = integratedLoudness(eqd, 44100) - integratedLoudness(stereo, 44100)
+      expect(Math.abs(eqLoudnessDelta(gains, spectrum) - actual)).toBeLessThan(0.05)
+    }
   })
 })
 

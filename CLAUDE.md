@@ -29,10 +29,17 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
   4× interpolator must stay in sync with `interpolatorPhases` in `loudness.ts`.
 - `src/audio/loudness.ts`, `spectrum.ts`, `wav.ts`: **pure** DSP (BS.1770 loudness, true peak, band
   levels, WAV encoder), run in `analysis.worker.ts` and covered by `dsp.test.ts`.
-- `src/engine.ts`: loading, the background measurement loop, and export. Measurement waits until every
-  track has loaded, because the tone-match reference (`SetProfile` in the store) is the median over all
-  tracks. The profile follows the tracks until the first export, then it's locked and persisted, so later
-  single-track exports stay consistent. Don't make it follow the tracks after that.
+- `src/engine.ts`: processing jobs and export. Each track gets one job at a time (`processTrack`) that
+  decodes once and does what's missing: input analysis, then a stage render (pre gain → high-pass →
+  dynamics) analyzed for loudness, true peak and spectrum, then makeup renders only when the limiter works
+  hard. Up to `CONCURRENCY` jobs run in parallel (worker pool in `analyzer.ts`).
+- The tone EQ is **not** in the measured stage: its loudness change is computed from the stage's
+  per-channel K-weighted spectrum (`eqLoudnessDelta` in `plan.ts`, exact to ~0.01 dB and covered by a
+  test), so Tone match changes never re-render. Export still measures the real output and corrects the
+  gain if it misses the target by more than 0.05 dB.
+- The tone reference (`SetProfile` in the store) is the median of the tracks' stage bands. It follows the
+  tracks until the first export, then it's locked and persisted, so later single-track exports stay
+  consistent. Don't make it follow the tracks after that.
 - `src/buffers.ts`: decoded audio isn't kept on tracks (about 85 MB per song). Always go through
   `getBuffer(id, file)`, a small LRU of decode promises. Tracks keep only `duration`, `peaks` and analyses.
 - `src/player.ts`: preview voice with a processed path and a loudness-matched original path for A/B.

@@ -21,7 +21,8 @@ export const loadWorklet = (ctx: BaseAudioContext) => {
 
 export type Chain = {
   input: AudioNode
-  // Everything before the post gain, used for loudness measurement renders.
+  // End of the dynamics stage (before tone EQ), used for measurement renders. The EQ's effect on
+  // loudness is computed from the measured spectrum instead, so tone changes need no re-render.
   stageOutput: AudioNode
   output: AudioNode
   dynamics: AudioWorkletNode
@@ -100,7 +101,7 @@ export const buildChain = (
 
   return {
     input: pre,
-    stageOutput: eq[eq.length - 1]!,
+    stageOutput: dynamics,
     output: limiterNode ?? post,
     dynamics,
     limiter: limiterNode,
@@ -153,13 +154,14 @@ export const chainLatency = () => {
   return latencyPromise
 }
 
-// Offline render of a track through the chain, trimmed to be sample-aligned with the source.
+// Offline render of a track through the chain. Returns per-channel views trimmed to be sample-aligned
+// with the source (no extra copy).
 export const renderChain = async (
   buffer: AudioBuffer,
   plan: Plan,
   postGainDb: number,
   mode: 'stage' | 'full',
-): Promise<AudioBuffer> => {
+): Promise<Float32Array[]> => {
   const latency = (await chainLatency())[mode]
   const ctx = new OfflineAudioContext(2, buffer.length + latency, SAMPLE_RATE)
   await loadWorklet(ctx)
@@ -170,9 +172,7 @@ export const renderChain = async (
   ;(mode === 'full' ? chain.output : chain.stageOutput).connect(ctx.destination)
   src.start()
   const rendered = await ctx.startRendering()
-  const out = new AudioBuffer({ numberOfChannels: 2, length: buffer.length, sampleRate: SAMPLE_RATE })
-  for (let c = 0; c < 2; c++) out.copyToChannel(rendered.getChannelData(c).subarray(latency), c)
-  return out
+  return [0, 1].map(c => rendered.getChannelData(c).subarray(latency, latency + buffer.length))
 }
 
 // Decode any browser-supported audio file to a stereo 44.1 kHz buffer.

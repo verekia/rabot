@@ -28,10 +28,11 @@ and ↑/↓ change the selected track. Playback continues into the next track, l
 
 ## Analysis
 
-When you add tracks, they're analyzed automatically (loudness, peaks, spectral balance), then each one is
-measured through the processing chain. A progress bar shows where it's at; 30 songs take about a minute.
-You can preview right away. Changing a dial re-measures in the background ("Updating…") while the preview
-follows instantly.
+When you add tracks, they're analyzed automatically, several at a time: loudness and peaks, then each one
+is measured through the dynamics stage along with its spectral balance. A progress bar shows where it's at;
+30 songs take about 20 seconds. You can preview right away. Loudness and Tone match changes apply
+instantly; a Dynamics change re-measures in the background ("Updating…") while the preview follows
+instantly.
 
 ## Replacing one song later
 
@@ -56,9 +57,10 @@ decode → 44.1 kHz stereo → normalize to −18 LUFS → 25 Hz high-pass → d
    14 → 6 dB above the track's loudness depending on the dial.
 3. **Tone EQ**: low shelf, two peaking bands and a high shelf, solved so each band (bass, low mid,
    presence, air) moves by the requested amount relative to the mids.
-4. **Gain**: after steps 1–3 the track is rendered offline and measured, and the exact gain to hit the
-   loudness target is applied. If the limiter has real work to do, the full chain is rendered again and
-   the gain is corrected until the output lands on target.
+4. **Gain**: after steps 1–2 the track is rendered offline and measured, including its spectrum. The tone
+   EQ's effect on loudness is computed exactly from that spectrum, and the gain to hit the loudness target
+   is applied. If the limiter has real work to do, the full chain is rendered again and the gain is
+   corrected until the output lands on target.
 5. **Limiter**: lookahead true-peak limiter (4× oversampled detector) with a −1 dBTP ceiling. It
    doesn't overshoot or clip. A track shows its peak limiting only when it's 0.5 dB or more: green is
    inaudible, amber is fine, red means raise Dynamics or lower the Loudness target.

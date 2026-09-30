@@ -88,15 +88,30 @@ export const setGlobal = (patch: Partial<GlobalSettings>) =>
 
 // --- Derived ---------------------------------------------------------------------------------------
 
-export type TrackPlan = { plan: Plan; postGain: number; exact: boolean }
+export type TrackPlan = {
+  plan: Plan
+  postGain: number
+  // Peak limiting in dB (null until measured).
+  limiting: number | null
+  makeupKey: string
+  exact: boolean
+}
 
 type PlanState = Pick<Store, 'global' | 'profile'>
 
+// Plans are recomputed for every row on every store change, so cache them per track object (tracks are
+// immutable: an update creates a new object) for the current dials and profile.
+const planCache = new WeakMap<Track, { global: GlobalSettings; profile: SetProfile | null; result: TrackPlan }>()
+
 export const planTrack = (state: PlanState, track: Track): TrackPlan | null => {
   if (!track.raw) return null
-  const plan = makePlan(state.global, track.raw, state.profile?.bands ?? null)
-  const { gain, exact } = postGainFor(state.global, plan, track.stage ?? undefined)
-  return { plan, postGain: gain, exact }
+  const cached = planCache.get(track)
+  if (cached && cached.global === state.global && cached.profile === state.profile) return cached.result
+  const plan = makePlan(state.global, track.raw, track.stage, state.profile?.bands ?? null)
+  const g = postGainFor(state.global, plan, track.stage)
+  const result = { plan, postGain: g.gain, limiting: g.limiting, makeupKey: g.makeupKey, exact: g.exact }
+  planCache.set(track, { global: state.global, profile: state.profile, result })
+  return result
 }
 
 export const isStale = (state: PlanState, track: Track) => {
@@ -104,11 +119,11 @@ export const isStale = (state: PlanState, track: Track) => {
   return p !== null && !p.exact
 }
 
-// Profile built from the current tracks, or null when there aren't enough to compare.
+// Profile built from the measured tracks, or null when there aren't enough to compare.
 export const profileFromTracks = (tracks: Track[], locked: boolean): SetProfile | null => {
-  const ready = tracks.filter(t => t.raw)
-  const bands = referenceBands(ready.map(t => t.raw!))
-  return bands ? { bands, names: ready.map(t => t.name), locked } : null
+  const measured = tracks.filter(t => t.stage)
+  const bands = referenceBands(measured.map(t => t.stage!.bands))
+  return bands ? { bands, names: measured.map(t => t.name), locked } : null
 }
 
 export const sameNames = (a: string[], b: string[]) => a.length === b.length && a.every((n, i) => n === b[i])

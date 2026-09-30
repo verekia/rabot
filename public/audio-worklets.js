@@ -56,48 +56,68 @@ class Dynamics extends AudioWorkletProcessor {
     const l = input && input.length > 0 ? input[0] : null
     const r = input && input.length > 1 ? input[1] : l
     const size = this.delay + 1
+    // Below the start of the knee the gain computer is 0, so most samples skip the log entirely.
+    const kneeStart = R > 1 ? 10 ** ((T - W / 2) / 20) : Infinity
+    // State lives in locals during the loop (much faster than property access per sample).
+    const ring = this.holdRing
+    const lineL = this.lines[0]
+    const lineR = this.lines[1]
+    const outL = output[0]
+    const outR = output.length > 1 ? output[1] : null
+    let pos = this.pos
+    let holdMin = this.holdMin
+    let holdAge = this.holdAge
+    let gainDb = this.gainDb
+    let maxReduction = this.maxReduction
     for (let i = 0; i < frames; i++) {
       const xl = l ? l[i] : 0
       const xr = r ? r[i] : 0
       const al = xl < 0 ? -xl : xl
       const ar = xr < 0 ? -xr : xr
       const peak = al > ar ? al : ar
-      const over = 20 * Math.log10(peak + 1e-12) - T
       let target = 0
-      if (R > 1) {
-        if (2 * over > W) target = slope * over
-        else if (W > 0 && 2 * over > -W) target = (slope * (over + W / 2) ** 2) / (2 * W)
+      if (peak > kneeStart) {
+        const over = 20 * Math.log10(peak) - T
+        target = 2 * over > W ? slope * over : (slope * (over + W / 2) ** 2) / (2 * W)
       }
-      const ring = this.holdRing
-      ring[this.pos] = target
-      if (target <= this.holdMin) {
-        this.holdMin = target
-        this.holdAge = 0
-      } else if (++this.holdAge >= size) {
+      ring[pos] = target
+      if (target <= holdMin) {
+        holdMin = target
+        holdAge = 0
+      } else if (++holdAge >= size) {
         let min = 0
         let age = 0
         for (let k = 0; k < size; k++) {
-          const v = ring[(this.pos - k + size) % size]
-          if (v < min) {
-            min = v
+          const idx = pos - k < 0 ? pos - k + size : pos - k
+          if (ring[idx] < min) {
+            min = ring[idx]
             age = k
           }
         }
-        this.holdMin = min
-        this.holdAge = age
+        holdMin = min
+        holdAge = age
       }
-      const held = this.holdMin
-      this.gainDb = held < this.gainDb ? att * this.gainDb + (1 - att) * held : rel * this.gainDb + (1 - rel) * held
-      if (-this.gainDb > this.maxReduction) this.maxReduction = -this.gainDb
-      const g = Math.exp(this.gainDb * 0.11512925464970229)
+      let g = 1
+      if (holdMin < 0 || gainDb < 0) {
+        gainDb = holdMin < gainDb ? att * gainDb + (1 - att) * holdMin : rel * gainDb + (1 - rel) * holdMin
+        // Snap the tail of the release back to unity so idle stretches skip the exp.
+        if (holdMin === 0 && gainDb > -1e-5) gainDb = 0
+        if (-gainDb > maxReduction) maxReduction = -gainDb
+        g = Math.exp(gainDb * 0.11512925464970229)
+      }
 
-      this.lines[0][this.pos] = xl
-      this.lines[1][this.pos] = xr
-      const read = (this.pos + 1) % size
-      output[0][i] = this.lines[0][read] * g
-      if (output.length > 1) output[1][i] = this.lines[1][read] * g
-      this.pos = read
+      lineL[pos] = xl
+      lineR[pos] = xr
+      const read = pos + 1 === size ? 0 : pos + 1
+      outL[i] = lineL[read] * g
+      if (outR) outR[i] = lineR[read] * g
+      pos = read
     }
+    this.pos = pos
+    this.holdMin = holdMin
+    this.holdAge = holdAge
+    this.gainDb = gainDb
+    this.maxReduction = maxReduction
     if (this.report) {
       this.reportCounter += frames
       if (this.reportCounter >= 2048) {
@@ -151,6 +171,9 @@ class TruePeakLimiter extends AudioWorkletProcessor {
     this.window = Math.max(8, Math.round((opts.lookahead ?? 0.0015) * sampleRate))
     this.releaseMul = Math.exp(-1 / ((opts.release ?? 0.1) * sampleRate))
     this.phases = makePhases()
+    // Largest possible gain of the interpolator: if every sample in the window is below ceiling / bound,
+    // no inter-sample peak can reach the ceiling and the oversampling can be skipped.
+    this.bound = Math.max(...this.phases.map(t => t.reduce((a, v) => a + Math.abs(v), 0)))
     this.channels = 2
     // Each history is stored twice so the FIR reads a contiguous run without wrapping.
     this.history = [new Float64Array(2 * TAPS), new Float64Array(2 * TAPS)]
@@ -196,6 +219,13 @@ class TruePeakLimiter extends AudioWorkletProcessor {
         const s0 = h[newest - HALF]
         let a = s0 < 0 ? -s0 : s0
         if (a > peak) peak = a
+        let windowMax = 0
+        for (let k = 0; k < TAPS; k++) {
+          const v = h[newest - k]
+          const av = v < 0 ? -v : v
+          if (av > windowMax) windowMax = av
+        }
+        if (windowMax * this.bound <= this.ceiling) continue
         for (let p = 1; p < OVERSAMPLE; p++) {
           const taps = phases[p]
           let acc = 0
