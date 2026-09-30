@@ -58,8 +58,9 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
 
 - Don't swap the custom `dynamics` worklet back to `DynamicsCompressorNode`. Measured on real tracks, the
   native node barely changes peak-to-loudness ratio, and it adds automatic makeup gain.
-- Dynamics sits **before** the tone EQ on purpose: its threshold is relative to the −18 LUFS normalized
-  level, and EQ would shift that per track.
+- Dynamics is a **transient catcher**, not a leveler (the user's intent: tame spiky drums, don't
+  homogenize level). Its threshold is relative to the track's typical peaks (`typicalPeakDb` in
+  `plan.ts`), with a fast release. It sits before the tone EQ so EQ doesn't shift the threshold.
 - Web Audio reads a highpass/lowpass `Q` in dB (peaking filters take it linear). The high-pass uses
   `HIGHPASS_Q_DB` (−3.01 dB = Butterworth); a linear 0.707 there adds a resonant bump.
 - Worklet processors return `true` from `process()` and so never die on their own. `Chain.disconnect()`

@@ -1,7 +1,7 @@
 // Turns the dials + per-track analysis into concrete processing parameters. Pure and deterministic:
 // the preview graph and the export render are both built from the same Plan.
 
-import type { Biquad } from './loudness'
+import { toDb, type Biquad } from './loudness'
 import type { Signature } from './model'
 import { BANDS, biquadPower, MID_BAND, SPECTRUM_BINS, spectrumBinHz } from './spectrum'
 
@@ -204,23 +204,45 @@ export const eqLoudnessDelta = (gains: number[], spectrum: Float32Array) => {
 
 // --- Dynamics --------------------------------------------------------------------------------------
 
-export const compressorFor = (amount: number): CompressorParams => ({
-  // Distance between the track's loudness and where compression starts: 14 dB → 6 dB. A typical
-  // mastered track (peaks ~10 dB above its loudness) is barely touched at 50%; a dynamic, drum-heavy mix
-  // is pulled in toward it.
-  threshold: REFERENCE_LUFS + 14 - 8 * amount,
-  ratio: 1 + 3 * amount,
-  knee: 6,
-  // With 3 ms of lookahead, fast enough to shave drum attacks while keeping bass waveforms intact.
-  attack: 0.0015,
-  release: 0.12,
+// The dynamics stage is a transient catcher, not a leveler: it only reacts to peaks that stick out above
+// the track's own typical peaks, grabs them firmly and lets go quickly, so the body of the mix (and its
+// loudness from one section to the next) is left alone.
+
+// A track's typical peak level: the 90th percentile of its 10 ms peaks (dBFS), ignoring near-silence.
+// Brick-walled masters have almost all their peaks there, so they're barely touched; mixes with spiky
+// drums have peaks well above it, and those are what gets caught.
+const typicalPeakCache = new WeakMap<Signature, number>()
+export const typicalPeakDb = (sig: Signature) => {
+  const cached = typicalPeakCache.get(sig)
+  if (cached !== undefined) return cached
+  let mean = 0
+  for (let i = 0; i < sig.power.length; i++) mean += sig.power[i]!
+  mean /= Math.max(1, sig.power.length)
+  const levels: number[] = []
+  for (let i = 0; i < sig.peak.length; i++) if (sig.power[i]! > mean * 0.01) levels.push(toDb(sig.peak[i]!))
+  levels.sort((a, b) => a - b)
+  const value = levels.length ? levels[Math.floor((levels.length - 1) * 0.9)]! : toDb(sig.samplePeak)
+  typicalPeakCache.set(sig, value)
+  return value
+}
+
+// `typicalPeak` is in dBFS after the pre gain. The dial moves the threshold from 6 dB above the typical
+// peaks (only rare, extreme hits) down to the typical peaks themselves.
+export const compressorFor = (amount: number, typicalPeak: number): CompressorParams => ({
+  threshold: typicalPeak + 6 * (1 - amount),
+  ratio: amount > 0 ? 6 : 1,
+  knee: 3,
+  // With 3 ms of lookahead the gain is already down when the hit arrives; the short release recovers
+  // between hits instead of dragging down the whole mix.
+  attack: 0.001,
+  release: 0.05,
 })
 
 // --- Plan ------------------------------------------------------------------------------------------
 
 export const makePlan = (global: GlobalSettings, sig: Signature, reference: number[] | null): Plan => {
   const preGain = round(REFERENCE_LUFS - sig.lufs)
-  const comp = compressorFor(global.dynamics)
+  const comp = compressorFor(global.dynamics, round(typicalPeakDb(sig) + preGain))
   const desired = BANDS.map((_, b) =>
     TONE_MATCH_ENABLED && reference && b !== MID_BAND
       ? clamp((reference[b]! - sig.bands[b]!) * global.toneMatch, -MAX_CORRECTION_DB, MAX_CORRECTION_DB)

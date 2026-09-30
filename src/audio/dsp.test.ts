@@ -242,3 +242,43 @@ describe('export renderer', () => {
     expect(toDb(truePeak(out))).toBeLessThanOrEqual(-0.95)
   })
 })
+
+describe('dynamics', () => {
+  // Steady noise, optionally with 5 ms hits well above it every 250 ms (like a snappy snare).
+  const track = (hits: boolean) => {
+    let seed = 3
+    const random = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1
+    const channels = [0, 1].map(() =>
+      Float32Array.from({ length: 44100 * 10 }, (_, i) => {
+        const hit = hits && i % 11025 < 220
+        return random() * (hit ? 0.9 : 0.15)
+      }),
+    )
+    const weighted = kWeight(channels, 44100)
+    const { power, peak } = segmentLevels(channels, weighted, 44100)
+    const sig: Signature = {
+      lufs: integratedLoudness(channels, 44100),
+      truePeak: toDb(truePeak(channels)),
+      samplePeak: Math.max(...peak),
+      bands: [0, 0, 0, 0, 0],
+      spectrum: new Float32Array(SPECTRUM_BINS),
+      power,
+      peak,
+    }
+    return sig
+  }
+
+  test('catches hits that stick out, leaves even peaks alone', () => {
+    for (const [hits, check] of [
+      [false, (peakDrop: number) => expect(peakDrop).toBeLessThan(0.5)],
+      [true, (peakDrop: number) => expect(peakDrop).toBeGreaterThan(3)],
+    ] as const) {
+      const sig = track(hits)
+      const off = makePlan({ ...DEFAULT_GLOBAL, dynamics: 0 }, sig, null)
+      const full = makePlan({ ...DEFAULT_GLOBAL, dynamics: 1 }, sig, null)
+      const before = simulateDynamics(sig, off.preGain, off.comp)
+      const after = simulateDynamics(sig, full.preGain, full.comp)
+      check(before.maxPeakDb - after.maxPeakDb)
+    }
+  })
+})

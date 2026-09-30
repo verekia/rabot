@@ -17,8 +17,10 @@ bun dev
 Two dials, applied to every track:
 
 - **Loudness**: the integrated loudness (LUFS, ITU-R BS.1770) every track is matched to.
-- **Dynamics**: tames transients that stick out above a track's own loudness, so percussive or
-  dynamic mixes get pulled in and already-dense masters are left alone. Off (0%) by default.
+- **Dynamics**: catches sharp transients (snappy drum hits) that stick out above a track's own typical
+  peaks, and lets go quickly, so the body of the mix and its level from section to section are left
+  alone. Tracks without spiky peaks (e.g. already-limited masters) are barely touched. Off (0%) by
+  default.
 
 Under each dial, a small bar shows what it's doing to the song that's playing (or selected): the gain
 applied, and the live transient reduction.
@@ -57,8 +59,10 @@ decode → 44.1 kHz stereo → normalize to −18 LUFS → 25 Hz high-pass → d
 
 1. **Normalize**: sets the input loudness to a fixed reference so the dynamics stage behaves the same on
    every track.
-2. **Dynamics**: stereo-linked lookahead (3 ms) peak compressor with a soft knee. Its threshold sits
-   14 → 6 dB above the track's loudness depending on the dial.
+2. **Dynamics**: stereo-linked lookahead (3 ms) peak compressor tuned as a transient catcher: 6:1 ratio,
+   1 ms attack, 50 ms release, 3 dB knee. Its threshold is relative to the track's own typical peaks
+   (90th percentile of its 10 ms peaks): 6 dB above them at low settings (only extreme hits) down to
+   the typical peaks themselves at 100%.
 3. **Tone EQ**: low shelf, two peaking bands and a high shelf (flat while tone match is disabled).
 4. **Gain**: brings the track to the loudness target (predicted while previewing, measured and corrected
    on export).
