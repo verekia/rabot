@@ -21,8 +21,8 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
 - `src/audio/plan.ts`: **pure**. Turns dials + analysis into a `Plan` (pre gain, EQ gains, compressor
   params). `plan.key` identifies everything before the post gain; a `StageAnalysis` is only valid for a
   matching key. Also computes the post gain, the limiter makeup validity and the clean-target hint.
-- `src/audio/chain.ts`: the Web Audio graph (`buildChain`), used by **both** the realtime preview and the
-  OfflineAudioContext export. Never fork these paths. Also handles latency measurement (the export is
+- `src/audio/chain.ts`: the Web Audio graph (`buildChain`) for the realtime preview. Export runs the same
+  processors in workers (`offline.ts`); keep the two chains in the same order with the same parameters. Also handles latency measurement (the export is
   trimmed so it stays sample-aligned with the source) and decoding.
 - `public/audio-worklets.js`: plain-JS AudioWorklet processors: `dynamics` (lookahead peak compressor)
   and `true-peak-limiter`. They're in `public/` so `audioWorklet.addModule` can load them by URL. The
@@ -35,9 +35,14 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
   for any dial setting. Dials must never trigger renders; keep the simulation in sync with the worklets'
   gain curves and time constants.
 - `src/engine.ts`: analysis on add (`analyzeTrack`, up to `CONCURRENCY` in parallel via the worker pool in
-  `analyzer.ts`) and export. Only export renders full audio: render, measure, then correct by scaling
-  (when that can't push peaks into the limiter) or by re-rendering. Chrome runs all offline
-  AudioWorklet rendering on one thread, so parallel export renders don't help.
+  `analyzer.ts`) and export. Only export renders full audio.
+- `src/audio/offline.ts`: export rendering, run in the worker pool. It evaluates `public/audio-worklets.js`
+  with stand-ins for the AudioWorklet globals and feeds it 128-frame blocks, so export uses the exact same
+  dynamics/limiter code as the preview; gains and biquads follow the Web Audio spec formulas. Output
+  matches an OfflineAudioContext render to ~−128 dB. It then measures, corrects the gain (scaling when
+  safe, else re-rendering) and encodes the WAV in the worker. Don't move export back to
+  OfflineAudioContext: Chrome runs all offline AudioWorklets on one thread, so it can't parallelize.
+  `renderChain` in `chain.ts` (OfflineAudioContext) is kept as the reference for verifying it (dev handle).
 - Linear filters (25 Hz high-pass, tone EQ) change loudness predictably: `eqLoudnessDelta` and
   `highpassLoudnessDelta` in `plan.ts` compute it from the per-channel K-weighted spectrum.
 - Tone match is disabled (`TONE_MATCH_ENABLED = false` in `plan.ts`): the EQ stays flat and its dial is

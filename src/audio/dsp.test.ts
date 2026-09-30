@@ -12,6 +12,7 @@ import {
   type Biquad,
 } from './loudness'
 import { simulateDynamics, solveGain, type Signature } from './model'
+import { renderOffline } from './offline'
 import {
   bandResponse,
   DEFAULT_GLOBAL,
@@ -209,5 +210,35 @@ describe('model', () => {
     const { gain, limiting } = solveGain(d, sig, 0, -20)
     expect(limiting).toBe(0)
     expect(gain).toBeCloseTo(-2, 2)
+  })
+})
+
+describe('export renderer', () => {
+  const workletUrl = new URL('../../public/audio-worklets.js', import.meta.url).href
+  const flat = {
+    preGain: 0,
+    eq: [0, 0, 0, 0],
+    comp: { threshold: 0, ratio: 1, knee: 6, attack: 0.0015, release: 0.12 },
+    key: '',
+  }
+
+  test('output stays sample-aligned with the input', async () => {
+    // A non-periodic signal (so any lag is unambiguous) through a neutral chain.
+    const s = Float32Array.from({ length: 44100 }, (_, i) => 0.1 * Math.sin(i * 0.05 + 0.00002 * i * i))
+    const [out] = await renderOffline([s, s], flat, 0, workletUrl)
+    const correlation = (lag: number) => {
+      let c = 0
+      for (let i = 4410; i < s.length - 4410; i++) c += out![i]! * s[i + lag]!
+      return c
+    }
+    const lags = [-3, -2, -1, 0, 1, 2, 3]
+    const best = lags.reduce((a, b) => (correlation(b) > correlation(a) ? b : a))
+    expect(best).toBe(0)
+  })
+
+  test('the limiter holds the true-peak ceiling when driven 6 dB into it', async () => {
+    const s = sine(997, 1, 2, 44100, 0.3)
+    const out = await renderOffline([s, s], flat, 5, workletUrl)
+    expect(toDb(truePeak(out))).toBeLessThanOrEqual(-0.95)
   })
 })

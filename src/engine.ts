@@ -4,11 +4,10 @@
 
 import { Zip, ZipPassThrough } from 'fflate'
 
-import { analyzeSignature, bufferChannels, CONCURRENCY, measure } from './audio/analyzer'
+import { analyzeSignature, bufferChannels, CONCURRENCY, measure, renderExport } from './audio/analyzer'
 import { renderChain } from './audio/chain'
-import { fromDb } from './audio/loudness'
-import { CEILING_DBTP, SAMPLE_RATE } from './audio/plan'
-import { encodeWav24 } from './audio/wav'
+import { renderOffline } from './audio/offline'
+import { SAMPLE_RATE } from './audio/plan'
 import { dropBuffer, getBuffer } from './buffers'
 import { player } from './player'
 import { planTrack, profileFromTracks, sameNames, updateTrack, useStore, type Track } from './store'
@@ -160,45 +159,21 @@ useStore.subscribe(state => {
 })
 
 // --- Export ----------------------------------------------------------------------------------------
-// Only here is the full audio processed: rendered through the chain and measured. If the prediction
-// missed the target by more than 0.05 dB, the result is corrected: by simply scaling the rendered audio
-// when that can't push peaks into the limiter (the common case), otherwise by re-rendering with a
-// corrected gain (secant steps, since the limiter makes each dB of gain worth less than a dB).
-
-const TOLERANCE_DB = 0.05
+// Only here is the full audio processed, in the worker pool (see audio/offline.ts): each track is
+// rendered through the chain, measured, corrected to the loudness target and encoded there.
 
 const renderWav = async (id: string) => {
   const state = useStore.getState()
   const track = state.tracks.find(t => t.id === id)!
   const tp = planTrack(state, track)!
-  const target = state.global.target
   const buffer = await getBuffer(track.id, track.file)
-  let gain = tp.postGain
-  let channels = await renderChain(buffer, tp.plan, gain)
-  let result = await measure(channels, SAMPLE_RATE)
-  let previous: { gain: number; lufs: number } | null = null
-  for (let i = 0; i < 3; i++) {
-    const error = target - result.lufs
-    if (Math.abs(error) <= TOLERANCE_DB) break
-    if (error < 0 || result.truePeak + error <= CEILING_DBTP) {
-      // Linear correction: turning down is always clean, and turning up is clean while the true peak
-      // stays under the ceiling.
-      const scale = fromDb(error)
-      for (const ch of channels) for (let k = 0; k < ch.length; k++) ch[k] = ch[k]! * scale
-      result = { lufs: result.lufs + error, truePeak: result.truePeak + error }
-      break
-    }
-    const slope =
-      previous && gain !== previous.gain
-        ? Math.min(1, Math.max(0.2, (result.lufs - previous.lufs) / (gain - previous.gain)))
-        : 1
-    previous = { gain, lufs: result.lufs }
-    gain += error / slope
-    channels = await renderChain(buffer, tp.plan, gain)
-    result = await measure(channels, SAMPLE_RATE)
-  }
+  const result = await renderExport(bufferChannels(buffer), {
+    plan: tp.plan,
+    postGain: tp.postGain,
+    target: state.global.target,
+  })
   updateTrack(id, { output: { key: tp.key, lufs: result.lufs, truePeak: result.truePeak } })
-  return encodeWav24(channels, SAMPLE_RATE)
+  return result.wav
 }
 
 const wavName = (name: string) => `${name.replace(/\.[^.]+$/, '')}.wav`
@@ -274,6 +249,6 @@ export const exportAll = async () => {
 // Dev-only handle for poking at the pipeline from the console.
 if (process.env.NODE_ENV === 'development') {
   Object.assign(window, {
-    __rabot: { useStore, planTrack, renderChain, measure, getBuffer, exportAll, exportTrack, player },
+    __rabot: { useStore, planTrack, renderChain, renderOffline, measure, getBuffer, exportAll, exportTrack, player },
   })
 }

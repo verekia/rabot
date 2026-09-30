@@ -153,7 +153,7 @@ const filterResponse = (index: number, gainDb: number) => {
 }
 
 // The high-pass at the start of the chain, per the Web Audio formula (Q in dB).
-const highpassBiquad = (): Biquad => {
+export const highpassBiquad = (): Biquad => {
   const w0 = (2 * Math.PI * HIGHPASS_HZ) / SAMPLE_RATE
   const cos = Math.cos(w0)
   const alpha = Math.sin(w0) / (2 * 10 ** (HIGHPASS_Q_DB / 20))

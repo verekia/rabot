@@ -38,7 +38,8 @@ and ↑/↓ change the selected track. Playback continues into the next track, l
    the limiter on the level profile. Every dial change is instant. The prediction is typically within
    0.1–0.3 dB of the real result.
 3. **On export:** each track is rendered through the full chain, measured, and corrected if it missed the
-   target by more than 0.05 dB, so exported files are exact.
+   target by more than 0.05 dB, so exported files are exact. Rendering runs in parallel Web Workers using
+   the same compressor and limiter code as the preview; 30 songs export in about 30 seconds.
 
 Tone match (pulling each track's EQ toward the set's average) is disabled for now: the EQ stays flat.
 

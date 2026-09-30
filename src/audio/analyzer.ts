@@ -1,7 +1,7 @@
-import type { AnalysisRequest, AnalysisResponse } from './analysis.worker'
+import type { AnalysisRequest, AnalysisResponse, ExportOptions } from './analysis.worker'
 import type { Signature } from './model'
 
-// Several tracks are analyzed at once, one worker each.
+// Several tracks are analyzed (and exported) at once, one worker each.
 export const CONCURRENCY = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 2) / 2)))
 
 type PoolWorker = { worker: Worker; busy: number }
@@ -26,7 +26,12 @@ const leastBusy = () => {
   return pool.reduce((a, b) => (b.busy < a.busy ? b : a))
 }
 
-const run = (kind: AnalysisRequest['kind'], channels: Float32Array[], sampleRate: number) => {
+const run = (
+  kind: AnalysisRequest['kind'],
+  channels: Float32Array[],
+  sampleRate: number,
+  exportOptions?: ExportOptions,
+) => {
   // Copies, so callers can pass views into buffers they keep using.
   const copies = channels.map(c => c.slice())
   const id = nextId++
@@ -34,7 +39,7 @@ const run = (kind: AnalysisRequest['kind'], channels: Float32Array[], sampleRate
   slot.busy++
   return new Promise<AnalysisResponse>(resolve => {
     pending.set(id, { resolve, slot })
-    const request: AnalysisRequest = { id, kind, channels: copies, sampleRate }
+    const request: AnalysisRequest = { id, kind, channels: copies, sampleRate, export: exportOptions }
     slot.worker.postMessage(
       request,
       copies.map(c => c.buffer),
@@ -54,6 +59,14 @@ export const measure = async (channels: Float32Array[], sampleRate: number) => {
   const r = await run('verify', channels, sampleRate)
   if (r.kind !== 'verify') throw new Error('Unexpected analysis response')
   return { lufs: r.lufs, truePeak: r.truePeak }
+}
+
+// Full export of one track in a worker: render, verify/correct loudness, encode. Returns the WAV bytes.
+export const renderExport = async (channels: Float32Array[], options: Omit<ExportOptions, 'workletUrl'>) => {
+  const workletUrl = new URL('/audio-worklets.js', location.origin).href
+  const r = await run('export', channels, 44100, { ...options, workletUrl })
+  if (r.kind !== 'export') throw new Error('Unexpected analysis response')
+  return { wav: r.wav, lufs: r.lufs, truePeak: r.truePeak }
 }
 
 export const bufferChannels = (buffer: AudioBuffer) =>
