@@ -1,10 +1,14 @@
-// 24-bit PCM WAV encoder. 24-bit keeps the processed float signal without audible requantization,
-// so no dither is needed.
+// 16-bit PCM WAV encoder with TPDF dither.
+//
+// Truncating the processed float signal to 16 bits would correlate the rounding error with the music
+// (audible as grainy distortion on quiet passages and fades). Triangular dither of ±1 LSB turns it into
+// a constant, inaudible noise floor (~-96 dBFS). The dither generator is seeded, so exporting the same
+// audio twice gives byte-identical files.
 
-export const encodeWav24 = (channels: Float32Array[], sampleRate: number): Uint8Array => {
+export const encodeWav16 = (channels: Float32Array[], sampleRate: number): Uint8Array => {
   const numChannels = channels.length
   const length = channels[0]?.length ?? 0
-  const bytesPerSample = 3
+  const bytesPerSample = 2
   const blockAlign = numChannels * bytesPerSample
   const dataSize = length * blockAlign
   const out = new Uint8Array(44 + dataSize)
@@ -26,16 +30,24 @@ export const encodeWav24 = (channels: Float32Array[], sampleRate: number): Uint8
   ascii(36, 'data')
   view.setUint32(40, dataSize, true)
 
-  const max = 0x7fffff
+  // xorshift32, uniform in [0, 1).
+  let seed = 0x9e3779b9
+  const random = () => {
+    seed ^= seed << 13
+    seed ^= seed >>> 17
+    seed ^= seed << 5
+    return (seed >>> 0) / 4294967296
+  }
+
+  const scale = 32767
   let offset = 44
   for (let i = 0; i < length; i++) {
     for (let c = 0; c < numChannels; c++) {
-      const s = Math.max(-1, Math.min(1, channels[c]![i]!))
-      const v = Math.round(s * max)
-      out[offset] = v & 0xff
-      out[offset + 1] = (v >> 8) & 0xff
-      out[offset + 2] = (v >> 16) & 0xff
-      offset += 3
+      // Sum of two uniform variables: triangular distribution over ±1 LSB.
+      const dither = random() - random()
+      const v = Math.max(-32768, Math.min(32767, Math.round(channels[c]![i]! * scale + dither)))
+      view.setInt16(offset, v, true)
+      offset += 2
     }
   }
   return out

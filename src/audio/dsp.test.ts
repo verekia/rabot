@@ -25,7 +25,7 @@ import {
   toneBiquad,
 } from './plan'
 import { analyzeSpectrum, SPECTRUM_BINS } from './spectrum'
-import { encodeWav24 } from './wav'
+import { encodeWav16 } from './wav'
 
 const sine = (hz: number, amplitude: number, seconds: number, sampleRate: number, phase = 0) =>
   Float32Array.from(
@@ -159,16 +159,23 @@ describe('tone match', () => {
 })
 
 describe('wav', () => {
-  test('writes a valid 24-bit stereo header and samples', () => {
-    const out = encodeWav24([new Float32Array([0, 1]), new Float32Array([-1, 0.5])], 44100)
+  test('writes a valid 44.1 kHz 16-bit stereo header and dithered samples', () => {
+    const left = Float32Array.from({ length: 1000 }, (_, i) => Math.sin(i / 10) * 0.5)
+    const right = Float32Array.from({ length: 1000 }, () => 1)
+    const out = encodeWav16([left, right], 44100)
     const view = new DataView(out.buffer)
     expect(String.fromCharCode(...out.slice(0, 4))).toBe('RIFF')
+    expect(view.getUint16(22, true)).toBe(2)
     expect(view.getUint32(24, true)).toBe(44100)
-    expect(view.getUint16(34, true)).toBe(24)
-    expect(view.getUint32(40, true)).toBe(12)
-    const s = (o: number) => ((out[o]! | (out[o + 1]! << 8) | (out[o + 2]! << 16)) << 8) >> 8
-    expect(s(44 + 3)).toBe(-0x7fffff)
-    expect(s(44 + 6)).toBe(0x7fffff)
+    expect(view.getUint16(34, true)).toBe(16)
+    expect(view.getUint32(40, true)).toBe(1000 * 4)
+    for (let i = 0; i < 1000; i++) {
+      // TPDF dither stays within ±1 LSB of the exact value; full scale clamps instead of wrapping.
+      expect(Math.abs(view.getInt16(44 + i * 4, true) - left[i]! * 32767)).toBeLessThanOrEqual(1.5)
+      expect(view.getInt16(44 + i * 4 + 2, true)).toBeGreaterThanOrEqual(32766)
+    }
+    // Seeded dither: identical input gives identical bytes.
+    expect(encodeWav16([left, right], 44100)).toEqual(out)
   })
 })
 

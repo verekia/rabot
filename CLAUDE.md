@@ -3,7 +3,7 @@
 ## Project
 
 Rabot is a client-only tool that homogenizes backing tracks for live music (loudness, dynamics, tone)
-and exports 44.1 kHz / 24-bit WAVs, individually or zipped. Priorities, in order: tracks feel
+and exports 44.1 kHz / 16-bit WAVs (TPDF-dithered), individually or zipped. Priorities, in order: tracks feel
 homogeneous across the playlist, then no added distortion, then loudness (default −11 LUFS).
 
 Stack: Next.js (pages router, static export) · React · zustand · Tailwind · Bun · oxfmt · oxlint · warden.
@@ -28,7 +28,7 @@ bun test           # DSP unit tests (src/audio/*.test.ts)
   and `true-peak-limiter`. They're in `public/` so `audioWorklet.addModule` can load them by URL. The
   4× interpolator must stay in sync with `interpolatorPhases` in `loudness.ts`.
 - `src/audio/loudness.ts`, `spectrum.ts`, `wav.ts`: **pure** DSP (BS.1770 loudness, true peak, band
-  levels, WAV encoder), run in `analysis.worker.ts` and covered by `dsp.test.ts`.
+  levels, dithered 16-bit WAV encoder), run in `analysis.worker.ts` and covered by `dsp.test.ts`.
 - `src/audio/model.ts`: **pure**. The core of the interactivity: each track's `Signature` (loudness,
   true peak, spectrum, 10 ms K-weighted power + sample peak per segment) is measured once on add, and the
   dynamics stage + limiter are simulated on it (`simulateDynamics`, `solveGain`) to predict the post gain

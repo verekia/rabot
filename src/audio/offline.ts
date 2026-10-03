@@ -6,7 +6,7 @@
 
 import { fromDb, integratedLoudness, toDb, truePeak, type Biquad } from './loudness'
 import { CEILING_DBTP, highpassBiquad, SAMPLE_RATE, TONE_FILTERS, toneBiquad, type Plan } from './plan'
-import { encodeWav24 } from './wav'
+import { encodeWav16 } from './wav'
 
 type Parameters = Record<string, Float32Array>
 type Processor = {
@@ -145,5 +145,5 @@ export const renderExport = async (
     channels = await renderOffline(input, plan, gain, workletUrl)
     result = measure(channels)
   }
-  return { wav: encodeWav24(channels, SAMPLE_RATE), ...result }
+  return { wav: encodeWav16(channels, SAMPLE_RATE), ...result }
 }

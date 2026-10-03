@@ -1,7 +1,7 @@
 # Rabot
 
 Evens out a set of backing tracks for live playback. Drop in your MP3s, preview the result, and export
-44.1 kHz / 24-bit WAVs (all as a ZIP, or one track at a time). The goal is a playlist with no jumps in
+44.1 kHz / 16-bit WAVs (all as a ZIP, or one track at a time). The goal is a playlist with no jumps in
 level, punch or tone from one song to the next, not maximum digital loudness.
 
 Everything runs in the browser with the Web Audio API. The preview and the export use the same
