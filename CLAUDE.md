@@ -6,7 +6,7 @@ Rabot is a client-only tool that homogenizes backing tracks for live music (loud
 and exports 44.1 kHz / 16-bit WAVs (TPDF-dithered), individually or zipped. Priorities, in order: tracks feel
 homogeneous across the playlist, then no added distortion, then loudness (default −11 LUFS).
 
-Stack: Next.js (pages router, static export) · React · zustand · Tailwind · Bun · oxfmt · oxlint · warden.
+Stack: Next.js (pages router, static export) · React · zustand · Tailwind · Bun · bun fmt · oxlint · warden.
 
 ```bash
 bun dev            # portless rabot next dev
